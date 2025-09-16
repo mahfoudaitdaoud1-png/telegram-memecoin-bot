@@ -692,9 +692,10 @@ async def do_trade_push(bot):
         for chat_id in list(SUBS):
             sent = 0
             for m in pairs:
-                if TOP_N_PER_TICK > 0 and sent >= TOP_N_PER_TICK: break
+                if TOP_N_PER_TICK > 0 and sent >= TOP_N_PER_TICK:
+                    break
                 if float(m.get("age_min", 1e9)) >= MAX_AGE_MIN:
-                    continue  # too old for 🔥 alert
+                    continue
                 TRACKED.add(m["token"])
                 if m.get("is_first_time"):
                     await send_new_token(bot, chat_id, m)  # 🔥 + pin
@@ -702,6 +703,7 @@ async def do_trade_push(bot):
                 await asyncio.sleep(0.05)
     except Exception as e:
         log.exception(f"do_trade_push error: {e}")
+
 
 # ========= Jobs =========
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
@@ -808,11 +810,22 @@ async def health():
 
 @app.on_event("startup")
 async def _startup():
+    # Ensure subscriptions + first_seen cache are loaded at startup
+    global SUBS, FIRST_SEEN
+    SUBS = _load_subs_from_file()
+    FIRST_SEEN = _load_first_seen()
+
     await application.initialize()
+
     jq = application.job_queue
-    jq.run_repeating(auto_trade, interval=TRADE_SUMMARY_SEC,   first=3,  name="trade_tick")
-    jq.run_repeating(updater,    interval=UPDATE_INTERVAL_SEC, first=20, name="updates")
+    # ⚠️ Make sure Cloud Run env vars are set correctly:
+    # TRADE_SUMMARY_SEC = 90   (auto /trade cadence)
+    # UPDATE_INTERVAL_SEC = 5  (price update cadence)
+    jq.run_repeating(auto_trade, interval=TRADE_SUMMARY_SEC, first=3, name="trade_tick")
+    jq.run_repeating(updater, interval=UPDATE_INTERVAL_SEC, first=20, name="updates")
+
     await application.start()
+    log.info(f"Bot started with TRADE_SUMMARY_SEC={TRADE_SUMMARY_SEC}, UPDATE_INTERVAL_SEC={UPDATE_INTERVAL_SEC}")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -827,3 +840,4 @@ async def telegram_webhook(token: str, request: Request):
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return {"ok": True}
+
