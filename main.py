@@ -785,24 +785,45 @@ async def _post_init(app: Application):
     await _validate_subs(app.bot)
     log.info(f"Subscribers: {sorted(SUBS)}")
 
-def main():
-    if not TG: raise SystemExit("Missing TG token")
-    app = Application.builder().token(TG).post_init(_post_init).build()
+# ========= Webhook server for Cloud Run =========
+from fastapi import FastAPI, Request
 
-    app.add_handler(CommandHandler("start",      cmd_start))
-    app.add_handler(CommandHandler("id",         cmd_id))
-    app.add_handler(CommandHandler("subscribe",  cmd_sub))
-    app.add_handler(CommandHandler("unsubscribe",cmd_unsub))
-    app.add_handler(CommandHandler("status",     cmd_status))
-    app.add_handler(CommandHandler("trade",      cmd_trade))
+if not TG:
+    raise SystemExit("Missing TG token")
 
-    jq = app.job_queue
-    jq.run_repeating(auto_trade, interval=TRADE_SUMMARY_SEC,   first=3,  name="trade_5s")
-    jq.run_repeating(updater,    interval=UPDATE_INTERVAL_SEC, first=20, name="updates_90s")
+application = Application.builder().token(TG).post_init(_post_init).build()
 
-    log.info(f"Bot starting… /trade={TRADE_SUMMARY_SEC}s | updates={UPDATE_INTERVAL_SEC}s | "
-             f"cap={TOP_N_PER_TICK or 'unlimited'} | max_alert_age={MAX_AGE_MIN}m | update_stop={UPDATE_MAX_DURATION_MIN}m")
-    app.run_polling(allowed_updates=["message","edited_message"])
+application.add_handler(CommandHandler("start",      cmd_start))
+application.add_handler(CommandHandler("id",         cmd_id))
+application.add_handler(CommandHandler("subscribe",  cmd_sub))
+application.add_handler(CommandHandler("unsubscribe",cmd_unsub))
+application.add_handler(CommandHandler("status",     cmd_status))
+application.add_handler(CommandHandler("trade",      cmd_trade))
 
-if __name__ == "__main__":
-    main()
+app = FastAPI()
+
+@app.get("/")
+async def health():
+    return {"ok": True}
+
+@app.on_event("startup")
+async def _startup():
+    await application.initialize()
+    jq = application.job_queue
+    jq.run_repeating(auto_trade, interval=TRADE_SUMMARY_SEC,   first=3,  name="trade_tick")
+    jq.run_repeating(updater,    interval=UPDATE_INTERVAL_SEC, first=20, name="updates")
+    await application.start()
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await application.stop()
+    await application.shutdown()
+
+@app.post("/webhook/{token}")
+async def telegram_webhook(token: str, request: Request):
+    if token != TG:
+        return {"ok": False, "reason": "token mismatch"}
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return {"ok": True}
