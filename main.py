@@ -756,10 +756,13 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========= Commands =========
-async def cmd_start(u:Update,c:ContextTypes.DEFAULT_TYPE):
+async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global SUBS
     SUBS.add(u.effective_chat.id); _save_subs_to_file()
-    await u.message.reply_text(f"✅ Subscribed. Auto /trade {TRADE_SUMMARY_SEC}s + 🧊 updates {UPDATE_INTERVAL_SEC}s (stop after {UPDATE_MAX_DURATION_MIN} min).")
+    await u.message.reply_text(
+        f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s + 🧊 updates every {UPDATE_INTERVAL_SEC}s (stop after {UPDATE_MAX_DURATION_MIN} min)."
+    )
+
 
 async def cmd_id(u:Update,c:ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(str(u.effective_chat.id))
