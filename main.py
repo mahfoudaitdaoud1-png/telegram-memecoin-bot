@@ -704,6 +704,7 @@ async def do_trade_push(bot):
 
                 # 🔥 pin if first time OR not yet tracked this run
                 if m.get("is_first_time") or not already_tracked:
+                    m["_force_fire"] = True  # ensure caption shows 🔥
                     await send_new_token(bot, chat_id, m)  # 🔥 + pin
                     sent += 1
 
