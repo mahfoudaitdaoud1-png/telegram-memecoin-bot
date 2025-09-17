@@ -715,12 +715,12 @@ async def do_trade_push(bot):
 
 # ========= Jobs =========
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
-    log.info(f"[tick] auto_trade fired (interval={TRADE_SUMMARY_SEC}s)")
+    log.info(f"🔥 [tick] auto_trade fired (interval={TRADE_SUMMARY_SEC}s)")
     await do_trade_push(context.bot)
 
 
 async def updater(context: ContextTypes.DEFAULT_TYPE):
-    log.info(f"[tick] updater fired (interval={UPDATE_INTERVAL_SEC}s)")
+    log.info(f"🧊 [tick] updater fired (interval={UPDATE_INTERVAL_SEC}s)")
     """Send updates every UPDATE_INTERVAL_SEC; stop after UPDATE_MAX_DURATION_MIN since first detection."""
     try:
         if not TRACKED:
@@ -753,30 +753,6 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"updater job error: {e}")
 
-        for token in list(TRACKED):
-            first_rec = FIRST_SEEN.get(token) or {}
-            first_ts = int(first_rec.get("ts", now_ts))
-            if now_ts - first_ts >= UPDATE_MAX_DURATION_MIN * 60:
-                TRACKED.discard(token)
-                continue
-
-            current = _current_for_token(token)
-            if not current:
-                continue
-
-            if float(current.get("age_min", 1e9)) >= MAX_AGE_MIN:
-                TRACKED.discard(token)
-                continue
-
-            first_mcap = float(first_rec.get("first", 0.0))
-            current["first_mcap_usd"] = first_mcap
-            current["is_first_time"]  = False
-
-            for chat_id in list(SUBS):
-                await send_price_update(context.bot, chat_id, current)
-                await asyncio.sleep(0.02)
-    except Exception as e:
-        log.exception(f"updater job error: {e}")
 
 # ========= Commands =========
 async def cmd_start(u:Update,c:ContextTypes.DEFAULT_TYPE):
