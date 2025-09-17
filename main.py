@@ -777,10 +777,12 @@ async def cmd_unsub(u:Update,c:ContextTypes.DEFAULT_TYPE):
     SUBS.discard(u.effective_chat.id); _save_subs_to_file()
     await u.message.reply_text("❎ Unsubscribed.")
 
-async def cmd_status(u:Update,c:ContextTypes.DEFAULT_TYPE):
+async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
-        f"Subscribers: {len(SUBS)} | /trade {TRADE_SUMMARY_SEC}s | 🧊 {UPDATE_INTERVAL_SEC}s | "
-        f"Top/tick {TOP_N_PER_TICK or 'unlimited'} | Max alert age {int(MAX_AGE_MIN)}m | Update stop {UPDATE_MAX_DURATION_MIN}m")
+        f"Subscribers: {len(SUBS)} | 🔥 /trade every {TRADE_SUMMARY_SEC}s | 🧊 updates every {UPDATE_INTERVAL_SEC}s | "
+        f"Top/tick {TOP_N_PER_TICK or 'unlimited'} | Max alert age {int(MAX_AGE_MIN)}m | Update stop {UPDATE_MAX_DURATION_MIN}m"
+    )
+
 
 async def cmd_trade(u:Update,c:ContextTypes.DEFAULT_TYPE):
     pairs = best_per_token(fetch_matches()); decorate_with_first_seen(pairs)
