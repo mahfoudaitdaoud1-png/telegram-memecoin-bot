@@ -404,6 +404,8 @@ def _save_first_seen(d):
 
 FIRST_SEEN = _load_first_seen()
 TRACKED: Set[str] = set()  # tokens to generate price updates for
+# Remember the very first pinned message per (chat, token)
+LAST_PINNED: Dict[Tuple[int, str], int] = {}
 
 def decorate_with_first_seen(pairs):
     changed = False
@@ -534,7 +536,7 @@ def _pct_str(first: float, cur: float) -> str:
 
 def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     BLUE, BANK, XEMO = "🔵","🏦","𝕏"
-    fire_or_ice = "🧊" if is_update else ("🔥" if (m.get("is_first_time") or m.get("_force_fire")) else "🧊")
+    fire_or_ice = "🧊" if is_update else ("🔥" if m.get("is_first_time") else "🧊")
     first = float(m.get("first_mcap_usd") or 0)
     cur   = float(m.get("mcap_usd") or 0)
     pct   = _pct_str(first, cur)
@@ -665,7 +667,19 @@ async def send_new_token(bot, chat_id:int, m:dict):
     fb_text = overlap_line(m.get("tw_handle"))
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
-    await _send_or_photo(bot, chat_id, caption, kb, token=m.get("token"), logo_hint=m.get("logo_hint"), pin=True)
+
+    # Pin only the first time we ever pin this token in this chat
+    key = (chat_id, m.get("token") or "")
+    should_pin = key not in LAST_PINNED
+
+    msg_id = await _send_or_photo(
+        bot, chat_id, caption, kb,
+        token=m.get("token"), logo_hint=m.get("logo_hint"), pin=should_pin
+    )
+
+    if should_pin and msg_id:
+        LAST_PINNED[key] = msg_id
+
 
 async def send_price_update(bot, chat_id:int, m:dict):
     fb_text = "—"
@@ -704,7 +718,6 @@ async def do_trade_push(bot):
 
                 # 🔥 pin if first time OR not yet tracked this run
                 if m.get("is_first_time") or not already_tracked:
-                    m["_force_fire"] = True  # ensure caption shows 🔥
                     await send_new_token(bot, chat_id, m)  # 🔥 + pin
                     sent += 1
 
@@ -812,7 +825,6 @@ async def cmd_repin(u: Update, c: ContextTypes.DEFAULT_TYPE):
             continue
         # Force fire emoji & treat as first-time so the message gets pinned with 🔥
         cur["is_first_time"] = True
-        cur["_force_fire"] = True
         await send_new_token(c.bot, u.effective_chat.id, cur)
         sent += 1
         await asyncio.sleep(0.2)
