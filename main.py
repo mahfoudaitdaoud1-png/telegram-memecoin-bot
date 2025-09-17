@@ -534,7 +534,7 @@ def _pct_str(first: float, cur: float) -> str:
 
 def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     BLUE, BANK, XEMO = "🔵","🏦","𝕏"
-    fire_or_ice = "🧊" if is_update else "🔥" if m.get("is_first_time") else "🧊"
+    fire_or_ice = "🧊" if is_update else ("🔥" if (m.get("is_first_time") or m.get("_force_fire")) else "🧊")
     first = float(m.get("first_mcap_usd") or 0)
     cur   = float(m.get("mcap_usd") or 0)
     pct   = _pct_str(first, cur)
@@ -796,6 +796,29 @@ async def cmd_trade(u:Update,c:ContextTypes.DEFAULT_TYPE):
             await send_new_token(c.bot, u.effective_chat.id, m)  # 🔥 + pin
             sent += 1
         await asyncio.sleep(0.05)
+async def cmd_repin(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Re-post currently tracked tokens as 'first-time' so they pin with 🔥.
+    If nothing is tracked yet, tell the user.
+    """
+    if not TRACKED:
+        await u.message.reply_text("Nothing to repin yet — no tracked tokens.")
+        return
+
+    sent = 0
+    for token in list(TRACKED):
+        cur = _current_for_token(token)
+        if not cur:
+            continue
+        # Force fire emoji & treat as first-time so the message gets pinned with 🔥
+        cur["is_first_time"] = True
+        cur["_force_fire"] = True
+        await send_new_token(c.bot, u.effective_chat.id, cur)
+        sent += 1
+        await asyncio.sleep(0.2)
+
+    if sent == 0:
+        await u.message.reply_text("Tried to repin, but couldn’t refresh any tokens.")
 
 # ========= Main =========
 async def _post_init(app: Application):
@@ -820,6 +843,7 @@ application.add_handler(CommandHandler("subscribe",  cmd_sub))
 application.add_handler(CommandHandler("unsubscribe",cmd_unsub))
 application.add_handler(CommandHandler("status",     cmd_status))
 application.add_handler(CommandHandler("trade",      cmd_trade))
+application.add_handler(CommandHandler("repin",      cmd_repin))
 
 app = FastAPI()
 
