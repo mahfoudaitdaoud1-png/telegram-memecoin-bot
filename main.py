@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
+from datetime import timedelta
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
@@ -51,7 +52,7 @@ SEARCH_ALL_URL     = "https://api.dexscreener.com/latest/dex/search?q=chain:sola
 TOKEN_PAIRS_URL    = "https://api.dexscreener.com/token-pairs/v1/solana/{address}"  # used by updater & refresh
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "tg-memebot/trade-5s", "Accept": "*/*"})
+SESSION.headers.update({"User-Agent": f"tg-memebot/trade-{TRADE_SUMMARY_SEC}s", "Accept": "*/*"})
 HTTP_TIMEOUT = 20
 
 # ========= SUBSCRIPTIONS =========
@@ -696,25 +697,61 @@ async def do_trade_push(bot):
                     break
                 if float(m.get("age_min", 1e9)) >= MAX_AGE_MIN:
                     continue
+
+                # track first, then decide whether to pin
+                already_tracked = m["token"] in TRACKED
                 TRACKED.add(m["token"])
-                if m.get("is_first_time"):
+
+                # 🔥 pin if first time OR not yet tracked this run
+                if m.get("is_first_time") or not already_tracked:
                     await send_new_token(bot, chat_id, m)  # 🔥 + pin
                     sent += 1
+
                 await asyncio.sleep(0.05)
+
     except Exception as e:
         log.exception(f"do_trade_push error: {e}")
 
 
 # ========= Jobs =========
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
+    log.info(f"[tick] auto_trade fired (interval={TRADE_SUMMARY_SEC}s)")
     await do_trade_push(context.bot)
 
+
 async def updater(context: ContextTypes.DEFAULT_TYPE):
+    log.info(f"[tick] updater fired (interval={UPDATE_INTERVAL_SEC}s)")
     """Send updates every UPDATE_INTERVAL_SEC; stop after UPDATE_MAX_DURATION_MIN since first detection."""
     try:
-        if not TRACKED: return
+        if not TRACKED:
+            return
         now_ts = int(time.time())
         log.info(f"[updater] refreshing {len(TRACKED)} tracked tokens")
+
+        for token in list(TRACKED):
+            first_rec = FIRST_SEEN.get(token) or {}
+            first_ts = int(first_rec.get("ts", now_ts))
+            if now_ts - first_ts >= UPDATE_MAX_DURATION_MIN * 60:
+                TRACKED.discard(token)
+                continue
+
+            current = _current_for_token(token)
+            if not current:
+                continue
+
+            if float(current.get("age_min", 1e9)) >= MAX_AGE_MIN:
+                TRACKED.discard(token)
+                continue
+
+            first_mcap = float(first_rec.get("first", 0.0))
+            current["first_mcap_usd"] = first_mcap
+            current["is_first_time"]  = False
+
+            for chat_id in list(SUBS):
+                await send_price_update(context.bot, chat_id, current)
+                await asyncio.sleep(0.02)
+    except Exception as e:
+        log.exception(f"updater job error: {e}")
 
         for token in list(TRACKED):
             first_rec = FIRST_SEEN.get(token) or {}
@@ -818,11 +855,20 @@ async def _startup():
     await application.initialize()
 
     jq = application.job_queue
-    # ⚠️ Make sure Cloud Run env vars are set correctly:
-    # TRADE_SUMMARY_SEC = 90   (auto /trade cadence)
-    # UPDATE_INTERVAL_SEC = 5  (price update cadence)
-    jq.run_repeating(auto_trade, interval=TRADE_SUMMARY_SEC, first=3, name="trade_tick")
-    jq.run_repeating(updater, interval=UPDATE_INTERVAL_SEC, first=20, name="updates")
+    # Use timedelta to ensure these are seconds, not minutes.
+    jq.run_repeating(
+        auto_trade,
+        interval=timedelta(seconds=TRADE_SUMMARY_SEC),
+        first=timedelta(seconds=3),
+        name="trade_tick",
+    )
+    jq.run_repeating(
+        updater,
+        interval=timedelta(seconds=UPDATE_INTERVAL_SEC),
+        first=timedelta(seconds=20),
+        name="updates",
+    )
+
 
     await application.start()
     log.info(f"Bot started with TRADE_SUMMARY_SEC={TRADE_SUMMARY_SEC}, UPDATE_INTERVAL_SEC={UPDATE_INTERVAL_SEC}")
