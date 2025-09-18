@@ -809,28 +809,7 @@ async def cmd_trade(u:Update,c:ContextTypes.DEFAULT_TYPE):
             await send_new_token(c.bot, u.effective_chat.id, m)  # 🔥 + pin
             sent += 1
         await asyncio.sleep(0.05)
-async def cmd_repin(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """
-    Re-post currently tracked tokens as 'first-time' so they pin with 🔥.
-    If nothing is tracked yet, tell the user.
-    """
-    if not TRACKED:
-        await u.message.reply_text("Nothing to repin yet — no tracked tokens.")
-        return
 
-    sent = 0
-    for token in list(TRACKED):
-        cur = _current_for_token(token)
-        if not cur:
-            continue
-        # Force fire emoji & treat as first-time so the message gets pinned with 🔥
-        cur["is_first_time"] = True
-        await send_new_token(c.bot, u.effective_chat.id, cur)
-        sent += 1
-        await asyncio.sleep(0.2)
-
-    if sent == 0:
-        await u.message.reply_text("Tried to repin, but couldn’t refresh any tokens.")
 
 # ========= Main =========
 async def _post_init(app: Application):
@@ -855,7 +834,6 @@ application.add_handler(CommandHandler("subscribe",  cmd_sub))
 application.add_handler(CommandHandler("unsubscribe",cmd_unsub))
 application.add_handler(CommandHandler("status",     cmd_status))
 application.add_handler(CommandHandler("trade",      cmd_trade))
-application.add_handler(CommandHandler("repin",      cmd_repin))
 
 app = FastAPI()
 
