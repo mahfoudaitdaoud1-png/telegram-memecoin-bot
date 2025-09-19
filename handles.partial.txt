@@ -1044,3 +1044,4 @@
 @DOG_BTC_
 @barneytheboi
 @uchecrypt
+@binance
