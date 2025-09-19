@@ -809,6 +809,15 @@ async def cmd_trade(u:Update,c:ContextTypes.DEFAULT_TYPE):
             await send_new_token(c.bot, u.effective_chat.id, m)  # 🔥 + pin
             sent += 1
         await asyncio.sleep(0.05)
+# ========= Extra helper command =========
+async def cmd_fb(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    args = (u.message.text or "").split()
+    if len(args) < 2:
+        await u.message.reply_text("Usage: /fb handle")
+        return
+    handle = args[1].lstrip("@")
+    ol = overlap_line(handle)
+    await u.message.reply_text(f"Overlap for @{handle}:\n{ol}")
 
 
 # ========= Main =========
@@ -834,6 +843,7 @@ application.add_handler(CommandHandler("subscribe",  cmd_sub))
 application.add_handler(CommandHandler("unsubscribe",cmd_unsub))
 application.add_handler(CommandHandler("status",     cmd_status))
 application.add_handler(CommandHandler("trade",      cmd_trade))
+application.add_handler(CommandHandler("fb",         cmd_fb))
 
 app = FastAPI()
 
