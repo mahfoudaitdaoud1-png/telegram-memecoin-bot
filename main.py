@@ -484,8 +484,12 @@ def _nitter_get(path: str, params: Optional[Dict[str, str]] = None) -> Optional[
     return None
 
 _USERNAME_PATTERNS = [
+    # <a class="username" href="/user"><bdi>user</bdi></a>
     re.compile(r'class="username"[^>]*>\s*@?<bdi>\s*([^<\s]+)\s*</bdi>', re.IGNORECASE),
-    re.compile(r'href="/([^/"]+)"[^>]*class="username"', re.IGNORECASE),
+    # <a href="/user" class="username">
+    re.compile(r'<a[^>]+href="/([^/"]+)"[^>]+class="username"', re.IGNORECASE),
+    # <span class="username">@user</span>
+    re.compile(r'<span[^>]+class="username"[^>]*>\s*@?\s*([^<\s]+)\s*</span>', re.IGNORECASE),
 ]
 
 def _parse_nitter_usernames(html: str) -> List[str]:
@@ -500,23 +504,45 @@ def _parse_nitter_usernames(html: str) -> List[str]:
     return out
 
 def _followers_scrape_nitter(handle: str, max_total: int = 1000, max_pages: int = 8) -> Optional[Set[str]]:
-    """Scrape followers from a Nitter instance (no API needed)."""
     if not handle:
         return None
+
+    def _fetch_page(pg: int) -> Optional[str]:
+        # page 1: try without any query first
+        if pg == 1:
+            html = _nitter_get(f"/{handle}/followers", params=None)
+            if html:
+                return html
+        # common pager: ?page=N
+        html = _nitter_get(f"/{handle}/followers", params={"page": str(pg)})
+        if html:
+            return html
+        # some instances use ?p=N
+        html = _nitter_get(f"/{handle}/followers", params={"p": str(pg)})
+        return html
+
     seen: Set[str] = set()
     for page in range(1, max_pages + 1):
-        html = _nitter_get(f"/{handle}/followers", params={"p": str(page)})
+        html = _fetch_page(page)
         if not html:
             break
+
+        # crude rate-limit / error detection
+        low = html.lower()
+        if ("rate limit" in low) or ("please try again later" in low):
+            break
+
         batch = _parse_nitter_usernames(html)
         batch = [h for h in batch if h and h != handle.lower()]
         before = len(seen)
         for h in batch:
             seen.add(h)
+        # stop if no new usernames or we reached the cap
         if len(seen) == before or len(seen) >= max_total:
             break
-        time.sleep(0.6)  # don’t hammer Nitter
+        time.sleep(0.6)  # be polite
     return seen if seen else None
+
 
 def _followers_static_load(handle: str) -> Optional[Set[str]]:
     handle = (handle or "").strip().lower()
@@ -904,7 +930,7 @@ async def cmd_fb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2:
         await u.message.reply_text("Usage: /fb handle")
         return
-    handle = args[1].lstrip("@")
+    handle = _normalize_handle(args[1])
     ol = overlap_line(handle)
     await u.message.reply_text(f"Overlap for @{handle}:\n{ol}")
 
