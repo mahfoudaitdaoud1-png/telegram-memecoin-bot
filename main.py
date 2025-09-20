@@ -20,6 +20,7 @@ TRADE_SUMMARY_SEC = int(os.getenv("TRADE_SUMMARY_SEC", "5"))       # auto /trade
 UPDATE_INTERVAL_SEC = int(os.getenv("UPDATE_INTERVAL_SEC", "90"))  # 🧊 price updates every 90s
 UPDATE_MAX_DURATION_MIN = int(os.getenv("UPDATE_MAX_DURATION_MIN", "60"))  # stop updates after 60 min since first detection
 
+DEBUG_FB = os.getenv("DEBUG_FB", "0") == "1"
 # ========= Filters =========
 MIN_LIQ_USD      = float(os.getenv("MIN_LIQ_USD",      "35000"))
 MIN_MCAP_USD     = float(os.getenv("MIN_MCAP_USD",     "70000"))
@@ -468,28 +469,51 @@ def _tw_api_get(url:str, params:Dict[str,str]) -> Optional[dict]:
 FB_STATIC_DIR = pathlib.Path(os.path.expanduser(os.getenv("FB_STATIC_DIR", "~/telegram-bot/followers_static")))
 FB_STATIC_DIR.mkdir(parents=True, exist_ok=True)
 # --------- Nitter scraper (no Twitter API) ----------
-NITTER_BASE = os.getenv("NITTER_BASE", "https://nitter.net").rstrip("/")
+# Try multiple mirrors; first entry is the env-provided one (if any)
+_NITTER_ENV = os.getenv("NITTER_BASE", "").rstrip("/")
+NITTER_MIRRORS = [m for m in [
+    _NITTER_ENV or None,
+    "https://nitter.net",
+    "https://nitter.poast.org",
+    "https://ntrqq.com",           # extra public mirror
+    "https://n.l5.ca",             # extra public mirror
+] if m]
 
-from typing import Optional, Dict  # make sure this import exists at the top
+from typing import Optional, Dict
 
-def _nitter_get(path: str, params: Optional[Dict[str, str]] = None) -> Optional[str]:
+def _nitter_get_from(base: str, path: str, params: Optional[Dict[str, str]] = None) -> Optional[str]:
     try:
-        url = f"{NITTER_BASE}{path}"
+        url = f"{base}{path}"
         r = SESSION.get(url, params=params or {}, timeout=20)
         if r.status_code == 200 and r.text:
+            if DEBUG_FB:
+                log.info(f"[nitter] {url} OK (len={len(r.text)})")
             return r.text
-        log.warning(f"Nitter fetch {url} -> {r.status_code}")
+        if DEBUG_FB:
+            log.info(f"[nitter] {url} -> {r.status_code}")
     except Exception as e:
-        log.warning(f"Nitter fetch error for {path}: {e}")
+        if DEBUG_FB:
+            log.info(f"[nitter] fetch error {base}{path}: {e}")
     return None
 
+def _nitter_get(path: str, params: Optional[Dict[str, str]] = None) -> Optional[str]:
+    # Try mirrors in order until one returns HTML
+    for base in NITTER_MIRRORS:
+        html = _nitter_get_from(base, path, params)
+        if html:
+            return html
+    return None
+
+# patterns seen on different Nitter skins
 _USERNAME_PATTERNS = [
     # <a class="username" href="/user"><bdi>user</bdi></a>
     re.compile(r'class="username"[^>]*>\s*@?<bdi>\s*([^<\s]+)\s*</bdi>', re.IGNORECASE),
     # <a href="/user" class="username">
-    re.compile(r'<a[^>]+href="/([^/"]+)"[^>]+class="username"', re.IGNORECASE),
-    # <span class="username">@user</span>
+    re.compile(r'<a[^>]+class="username"[^>]+href="/([^/"]+)"', re.IGNORECASE),
+    # <a href="/user" ...><span class="username">@user</span>
     re.compile(r'<span[^>]+class="username"[^>]*>\s*@?\s*([^<\s]+)\s*</span>', re.IGNORECASE),
+    # super-broad fallback: any /handle that’s immediately followed by class="username"
+    re.compile(r'href="/([A-Za-z0-9_]{1,15})"[^>]*class="username"', re.IGNORECASE),
 ]
 
 def _parse_nitter_usernames(html: str) -> List[str]:
@@ -501,23 +525,31 @@ def _parse_nitter_usernames(html: str) -> List[str]:
             h = _normalize_handle(m.group(1))
             if h:
                 out.append(h)
-    return out
+    # de-dupe but keep order
+    seen = set()
+    uniq = []
+    for h in out:
+        if h not in seen:
+            uniq.append(h); seen.add(h)
+    if DEBUG_FB:
+        log.info(f"[nitter] parsed {len(uniq)} usernames on page")
+    return uniq
 
 def _followers_scrape_nitter(handle: str, max_total: int = 1000, max_pages: int = 8) -> Optional[Set[str]]:
     if not handle:
         return None
 
     def _fetch_page(pg: int) -> Optional[str]:
-        # page 1: try without any query first
+        # page 1: try without query first
         if pg == 1:
             html = _nitter_get(f"/{handle}/followers", params=None)
             if html:
                 return html
-        # common pager: ?page=N
+        # most common pager
         html = _nitter_get(f"/{handle}/followers", params={"page": str(pg)})
         if html:
             return html
-        # some instances use ?p=N
+        # some instances use ?p=
         html = _nitter_get(f"/{handle}/followers", params={"p": str(pg)})
         return html
 
@@ -525,91 +557,33 @@ def _followers_scrape_nitter(handle: str, max_total: int = 1000, max_pages: int 
     for page in range(1, max_pages + 1):
         html = _fetch_page(page)
         if not html:
+            if DEBUG_FB:
+                log.info(f"[nitter] page {page}: no html")
             break
 
-        # crude rate-limit / error detection
         low = html.lower()
         if ("rate limit" in low) or ("please try again later" in low):
+            if DEBUG_FB:
+                log.info(f"[nitter] page {page}: rate-limited")
             break
 
         batch = _parse_nitter_usernames(html)
         batch = [h for h in batch if h and h != handle.lower()]
+
         before = len(seen)
         for h in batch:
             seen.add(h)
-        # stop if no new usernames or we reached the cap
+
+        if DEBUG_FB:
+            log.info(f"[nitter] page {page}: +{len(seen)-before}, total={len(seen)}")
+
         if len(seen) == before or len(seen) >= max_total:
             break
+
         time.sleep(0.6)  # be polite
+
     return seen if seen else None
 
-
-def _followers_static_load(handle: str) -> Optional[Set[str]]:
-    handle = (handle or "").strip().lower()
-    if not handle:
-        return None
-    txt = FB_STATIC_DIR / f"{handle}.txt"
-    jsn = FB_STATIC_DIR / f"{handle}.json"
-    try:
-        if txt.exists():
-            out = []
-            for line in txt.read_text(encoding="utf-8", errors="ignore").splitlines():
-                h = _normalize_handle(line)
-                if h:
-                    out.append(h)
-            return set(out)
-        if jsn.exists():
-            j = json.loads(jsn.read_text(encoding="utf-8"))
-            if isinstance(j, dict) and isinstance(j.get("followers"), list):
-                return { _normalize_handle(x) for x in j["followers"] if _normalize_handle(x) }
-    except Exception as e:
-        log.warning(f"static followers load failed for {handle}: {e}")
-    return None
-
-def fetch_followers_v2(handle: str, max_total: int = 1000) -> Optional[Set[str]]:
-    if not handle:
-        return None
-
-    # 1) static file
-    static = _followers_static_load(handle)
-    if static:
-        return static
-
-    # 2) cached JSON
-    cached = _followers_cache_load(handle)
-    if cached:
-        return cached
-
-    # 3) scrape from Nitter (free)
-    scraped = _followers_scrape_nitter(handle, max_total=max_total)
-    if scraped:
-        _followers_cache_save(handle, scraped)
-        return scraped
-
-    # 4) (optional) Twitter API if you add TW_BEARER later
-    if TW_BEARER:
-        return None
-
-    return None
-
-def overlap_line(tw_handle: Optional[str]) -> str:
-    if not tw_handle or not MY_HANDLES:
-        return "—"
-    followers = fetch_followers_v2(tw_handle, max_total=1000)
-    if not followers:
-        return "—"
-    overlap = sorted(MY_HANDLES & followers)
-    if not overlap:
-        return "—"
-    acc, total = [], 0
-    for h in overlap:
-        piece = "@" + h + ", "
-        if total + len(piece) > 180:
-            break
-        acc.append(piece)
-        total += len(piece)
-    s = "".join(acc).rstrip(", ")
-    return s + (" , …" if len(overlap) > len(acc) else "")
 
 
 
