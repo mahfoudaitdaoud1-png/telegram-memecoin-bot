@@ -583,6 +583,72 @@ def _followers_scrape_nitter(handle: str, max_total: int = 1000, max_pages: int 
         time.sleep(0.6)  # be polite
 
     return seen if seen else None
+def _followers_static_load(handle: str) -> Optional[Set[str]]:
+    handle = (handle or "").strip().lower()
+    if not handle:
+        return None
+    txt = FB_STATIC_DIR / f"{handle}.txt"
+    jsn = FB_STATIC_DIR / f"{handle}.json"
+    try:
+        if txt.exists():
+            out = []
+            for line in txt.read_text(encoding="utf-8", errors="ignore").splitlines():
+                h = _normalize_handle(line)
+                if h:
+                    out.append(h)
+            return set(out)
+        if jsn.exists():
+            j = json.loads(jsn.read_text(encoding="utf-8"))
+            if isinstance(j, dict) and isinstance(j.get("followers"), list):
+                return { _normalize_handle(x) for x in j["followers"] if _normalize_handle(x) }
+    except Exception as e:
+        log.warning(f"static followers load failed for {handle}: {e}")
+    return None
+
+def fetch_followers_v2(handle: str, max_total: int = 1000) -> Optional[Set[str]]:
+    if not handle:
+        return None
+
+    # 1) static file (free, no API)
+    static = _followers_static_load(handle)
+    if static:
+        return static
+
+    # 2) cached JSON
+    cached = _followers_cache_load(handle)
+    if cached:
+        return cached
+
+    # 3) scrape from Nitter (free)
+    scraped = _followers_scrape_nitter(handle, max_total=max_total)
+    if scraped:
+        _followers_cache_save(handle, scraped)
+        return scraped
+
+    # 4) (optional) Twitter API if TW_BEARER provided (not used here)
+    if TW_BEARER:
+        return None
+
+    return None
+
+def overlap_line(tw_handle: Optional[str]) -> str:
+    if not tw_handle or not MY_HANDLES:
+        return "—"
+    followers = fetch_followers_v2(tw_handle, max_total=1000)
+    if not followers:
+        return "—"
+    overlap = sorted(MY_HANDLES & followers)
+    if not overlap:
+        return "—"
+    acc, total = [], 0
+    for h in overlap:
+        piece = "@" + h + ", "
+        if total + len(piece) > 180:
+            break
+        acc.append(piece)
+        total += len(piece)
+    s = "".join(acc).rstrip(", ")
+    return s + (" , …" if len(overlap) > len(acc) else "")
 
 
 
