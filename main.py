@@ -505,6 +505,24 @@ def fetch_followers_v2(handle: str, max_total: int = 1000) -> Optional[Set[str]]
 
     # If you upgrade later, put the API code here and return a set of handles.
     return None
+def overlap_line(tw_handle: Optional[str]) -> str:
+    if not tw_handle or not MY_HANDLES:
+        return "—"
+    followers = fetch_followers_v2(tw_handle, max_total=1000)
+    if not followers:
+        return "—"
+    overlap = sorted(MY_HANDLES & followers)
+    if not overlap:
+        return "—"
+    acc, total = [], 0
+    for h in overlap:
+        piece = "@" + h + ", "
+        if total + len(piece) > 180:
+            break
+        acc.append(piece)
+        total += len(piece)
+    s = "".join(acc).rstrip(", ")
+    return s + (" , …" if len(overlap) > len(acc) else "")
 
 
 
