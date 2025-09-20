@@ -492,22 +492,20 @@ def fetch_followers_v2(handle: str, max_total: int = 1000) -> Optional[Set[str]]
     if not handle:
         return None
 
-    # 1) static file wins (no rate limits, no API required)
     static = _followers_static_load(handle)
     if static:
         return static
 
-    # 2) cached JSON (from a previous run)
     cached = _followers_cache_load(handle)
     if cached:
         return cached
 
-    # 3) free tier: stop here (we don’t call the API)
     if not TW_BEARER:
         return None
 
     # If you upgrade later, put the API code here and return a set of handles.
     return None
+
 
 
 
