@@ -10,6 +10,8 @@ from datetime import timedelta
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
+import sys
+log.info(f"Python runtime: {sys.version}")
 
 # ========= ENV / Cadence =========
 TG = os.getenv("TG", "").strip()
@@ -465,6 +467,56 @@ def _tw_api_get(url:str, params:Dict[str,str]) -> Optional[dict]:
 # NEW: static “followers” directory (free, no-API mode)
 FB_STATIC_DIR = pathlib.Path(os.path.expanduser(os.getenv("FB_STATIC_DIR", "~/telegram-bot/followers_static")))
 FB_STATIC_DIR.mkdir(parents=True, exist_ok=True)
+# --------- Nitter scraper (no Twitter API) ----------
+NITTER_BASE = os.getenv("NITTER_BASE", "https://nitter.net").rstrip("/")
+
+from typing import Optional, Dict  # make sure this import exists at the top
+
+def _nitter_get(path: str, params: Optional[Dict[str, str]] = None) -> Optional[str]:
+    try:
+        url = f"{NITTER_BASE}{path}"
+        r = SESSION.get(url, params=params or {}, timeout=20)
+        if r.status_code == 200 and r.text:
+            return r.text
+        log.warning(f"Nitter fetch {url} -> {r.status_code}")
+    except Exception as e:
+        log.warning(f"Nitter fetch error for {path}: {e}")
+    return None
+
+_USERNAME_PATTERNS = [
+    re.compile(r'class="username"[^>]*>\s*@?<bdi>\s*([^<\s]+)\s*</bdi>', re.IGNORECASE),
+    re.compile(r'href="/([^/"]+)"[^>]*class="username"', re.IGNORECASE),
+]
+
+def _parse_nitter_usernames(html: str) -> List[str]:
+    out: List[str] = []
+    if not html:
+        return out
+    for pat in _USERNAME_PATTERNS:
+        for m in pat.finditer(html):
+            h = _normalize_handle(m.group(1))
+            if h:
+                out.append(h)
+    return out
+
+def _followers_scrape_nitter(handle: str, max_total: int = 1000, max_pages: int = 8) -> Optional[Set[str]]:
+    """Scrape followers from a Nitter instance (no API needed)."""
+    if not handle:
+        return None
+    seen: Set[str] = set()
+    for page in range(1, max_pages + 1):
+        html = _nitter_get(f"/{handle}/followers", params={"p": str(page)})
+        if not html:
+            break
+        batch = _parse_nitter_usernames(html)
+        batch = [h for h in batch if h and h != handle.lower()]
+        before = len(seen)
+        for h in batch:
+            seen.add(h)
+        if len(seen) == before or len(seen) >= max_total:
+            break
+        time.sleep(0.6)  # don’t hammer Nitter
+    return seen if seen else None
 
 def _followers_static_load(handle: str) -> Optional[Set[str]]:
     handle = (handle or "").strip().lower()
@@ -492,19 +544,28 @@ def fetch_followers_v2(handle: str, max_total: int = 1000) -> Optional[Set[str]]
     if not handle:
         return None
 
+    # 1) static file
     static = _followers_static_load(handle)
     if static:
         return static
 
+    # 2) cached JSON
     cached = _followers_cache_load(handle)
     if cached:
         return cached
 
-    if not TW_BEARER:
+    # 3) scrape from Nitter (free)
+    scraped = _followers_scrape_nitter(handle, max_total=max_total)
+    if scraped:
+        _followers_cache_save(handle, scraped)
+        return scraped
+
+    # 4) (optional) Twitter API if you add TW_BEARER later
+    if TW_BEARER:
         return None
 
-    # If you upgrade later, put the API code here and return a set of handles.
     return None
+
 def overlap_line(tw_handle: Optional[str]) -> str:
     if not tw_handle or not MY_HANDLES:
         return "—"
