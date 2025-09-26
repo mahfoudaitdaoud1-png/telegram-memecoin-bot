@@ -1,15 +1,29 @@
-FROM python:3.12-slim
+# ----- base -----
+FROM python:3.11-slim
 
-WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# System hygiene
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
+# Install runtime deps (build tools only if you need extras)
 RUN pip install --no-cache-dir --upgrade pip
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy requirements first for layer caching
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY . .
+# Copy app code
+COPY . /app
 
+# Make the startup script executable
+RUN chmod +x /app/start.sh
+
+# Cloud Run listens on $PORT (defaults to 8080 if not provided)
 ENV PORT=8080
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
+
+# (Optional) document the port
+EXPOSE 8080
+
+# Launch
+CMD ["/app/start.sh"]
