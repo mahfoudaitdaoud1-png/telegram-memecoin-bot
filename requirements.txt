@@ -1,6 +1,19 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-python-telegram-bot==21.6
-requests>=2.32.2
+# FastAPI stack
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+
+# Telegram bot
+python-telegram-bot[rate-limiter]>=21.0
+
+# HTTP + parsing
+requests>=2.32.0
+
+# ASGI server utils (optional but fine)
+httptools>=0.6.0
+uvloop>=0.20.0
+
+# Runtime
+pydantic>=2.7.0
+anyio>=4.0.0
 
 
