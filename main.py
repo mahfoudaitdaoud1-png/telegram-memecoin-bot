@@ -14,7 +14,7 @@ import sys
 log.info(f"Python runtime: {sys.version}")
 
 # ========= ENV / Cadence =========
-TG = os.getenv("TG", "").strip()
+TG = (os.getenv("TG") or os.getenv("TG_TOKEN") or "").strip()
 ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID", "0"))
 TRADE_SUMMARY_SEC = int(os.getenv("TRADE_SUMMARY_SEC", "5"))       # auto /trade tick
 UPDATE_INTERVAL_SEC = int(os.getenv("UPDATE_INTERVAL_SEC", "90"))  # 🧊 price updates every 90s
