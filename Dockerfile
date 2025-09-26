@@ -1,29 +1,16 @@
-# ----- base -----
 FROM python:3.11-slim
 
-# System hygiene
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# Install runtime deps (build tools only if you need extras)
-RUN pip install --no-cache-dir --upgrade pip
-
-# Copy requirements first for layer caching
 WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy app code
-COPY . /app
-
-# Make the startup script executable
-RUN chmod +x /app/start.sh
-
-# Cloud Run listens on $PORT (defaults to 8080 if not provided)
+# (Optional but recommended) Prevent .pyc and enable unbuffered logs
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
 
-# (Optional) document the port
-EXPOSE 8080
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Launch
-CMD ["/app/start.sh"]
+COPY . .
+
+# Start the FastAPI app on the port Cloud Run expects
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
