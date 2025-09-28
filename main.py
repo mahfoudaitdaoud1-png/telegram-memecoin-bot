@@ -296,19 +296,26 @@ def _current_for_token(token_addr: str) -> Optional[dict]:
 
 # ---------- Enrichment helpers ----------
 def _enrich_if_needed(m: dict) -> dict:
-    """If age/mcap/vol are missing/zero, fetch live pair and merge into m."""
+    """Refresh from TOKEN_PAIRS_URL when any key metric is missing or liq is below threshold."""
     need_age = (m.get("age_min") in (None, float("inf")))
     need_mcap = float(m.get("mcap_usd") or 0) <= 0
     need_vol = float(m.get("vol24_usd") or 0) <= 0
-    if not (need_age or need_mcap or need_vol):
+    # NEW: if liquidity is below your filter, try to refresh before judging
+    need_liq = float(m.get("liquidity_usd") or 0) < MIN_LIQ_USD
+
+    if not (need_age or need_mcap or need_vol or need_liq):
         return m
+
     cur = _current_for_token(m.get("token"))
     if not cur:
         return m
-    for k in ("pair","price_usd","liquidity_usd","mcap_usd","vol24_usd","age_min","url","logo_hint","tw_url","tw_handle"):
+
+    for k in ("pair","price_usd","liquidity_usd","mcap_usd","vol24_usd",
+              "age_min","url","logo_hint","tw_url","tw_handle"):
         if cur.get(k) is not None:
             m[k] = cur[k]
     return m
+
 
 def passes_filters(p, now_ms):
     """Soft filter: keep liq strict; age/mcap/vol pass when missing (handled by enrichment later)."""
