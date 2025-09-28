@@ -1,26 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, time, json, logging, asyncio, pathlib, requests, re
-from typing import Dict, List, Set, Optional, Tuple
+import os, time, json, logging, asyncio, pathlib, requests, re, sys
+from typing import Dict, List, Set, Optional, Tuple, Any
 from urllib.parse import urlparse
+from datetime import timedelta
+
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.gzip import GZipMiddleware
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
-from datetime import timedelta
 
-logging.basicConfig(level=logging.INFO)
+# ================= Logging =================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
 log = logging.getLogger("bot")
-import sys
 log.info(f"Python runtime: {sys.version}")
 
 # ========= ENV / Cadence =========
 TG = os.getenv("TG", "").strip()
+if not TG:
+    raise SystemExit("Missing TG token (env TG)")
+
 ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID", "0"))
 TRADE_SUMMARY_SEC = int(os.getenv("TRADE_SUMMARY_SEC", "5"))       # auto /trade tick
 UPDATE_INTERVAL_SEC = int(os.getenv("UPDATE_INTERVAL_SEC", "90"))  # 🧊 price updates every 90s
 UPDATE_MAX_DURATION_MIN = int(os.getenv("UPDATE_MAX_DURATION_MIN", "60"))  # stop updates after 60 min since first detection
 
 DEBUG_FB = os.getenv("DEBUG_FB", "0") == "1"
+
 # ========= Filters =========
 MIN_LIQ_USD      = float(os.getenv("MIN_LIQ_USD",      "35000"))
 MIN_MCAP_USD     = float(os.getenv("MIN_MCAP_USD",     "70000"))
@@ -28,24 +36,31 @@ MIN_VOL_H24_USD  = float(os.getenv("MIN_VOL_H24_USD",  "40000"))
 MAX_AGE_MIN      = float(os.getenv("MAX_AGE_MIN",      "120"))     # alerts allowed only if pair age < 120m
 CHAIN_ID         = "solana"
 
-# Links
+# ========= Links =========
 AXIOM_WEB_URL    = os.getenv("AXIOM_WEB_URL") or os.getenv("AXIOME_WEB_URL") or "https://axiom.trade/meme/{pair}"
 GMGN_WEB_URL     = os.getenv("GMGN_WEB_URL",  "https://gmgn.ai/sol/token/{mint}")
 
-# Posting limits (0 = unlimited)
+# ========= Posting limits (0 = unlimited) =========
 TOP_N_PER_TICK   = int(os.getenv("TOP_N_PER_TICK", "0"))  # 0 → unlimited
 NO_MATCH_PING    = int(os.getenv("NO_MATCH_PING", "0"))
 
-# Files
-SUBS_FILE        = os.getenv("SUBS_FILE", os.path.expanduser("~/telegram-bot/subscribers.txt"))
-FIRST_SEEN_FILE  = os.getenv("FIRST_SEEN_FILE", os.path.expanduser("~/telegram-bot/first_seen_caps.json"))
-FALLBACK_LOGO    = os.getenv("FALLBACK_LOGO",   os.path.expanduser("~/telegram-bot/solana_fallback.png"))
+# ========= Writable files/dirs (Cloud Run: /tmp only) =========
+def _p(env_name: str, default_path: str) -> str:
+    return os.getenv(env_name, default_path)
 
-# Followed-by config
-MY_FOLLOWING_TXT    = os.getenv("MY_FOLLOWING_TXT", "handles.partial.txt")
+SUBS_FILE        = _p("SUBS_FILE",       "/tmp/telegram-bot/subscribers.txt")
+FIRST_SEEN_FILE  = _p("FIRST_SEEN_FILE", "/tmp/telegram-bot/first_seen_caps.json")
+FALLBACK_LOGO    = _p("FALLBACK_LOGO",   "/tmp/telegram-bot/solana_fallback.png")
+MY_FOLLOWING_TXT = _p("MY_FOLLOWING_TXT","handles.partial.txt")  # read-only ok
+
+# Followed-by cache dirs (writable)
+FOLLOWERS_CACHE_DIR = pathlib.Path(_p("FOLLOWERS_CACHE_DIR", "/tmp/telegram-bot/followers_cache"))
+FB_STATIC_DIR       = pathlib.Path(_p("FB_STATIC_DIR",       "/tmp/telegram-bot/followers_static"))
+for d in [pathlib.Path(SUBS_FILE).parent, pathlib.Path(FIRST_SEEN_FILE).parent, FOLLOWERS_CACHE_DIR, FB_STATIC_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# Twitter (optional)
 TW_BEARER           = os.getenv("TW_BEARER", "").strip()
-FOLLOWERS_CACHE_DIR = pathlib.Path(os.path.expanduser(os.getenv("FOLLOWERS_CACHE_DIR", "~/telegram-bot/followers_cache")))
-FOLLOWERS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========= Dexscreener endpoints =========
 TOKEN_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
@@ -66,11 +81,16 @@ def _load_subs_from_file() -> Set[int]:
     if not p.exists(): return set()
     try:
         return {int(x.strip()) for x in p.read_text().splitlines() if x.strip()}
-    except: return set()
+    except Exception as e:
+        log.warning("subs load failed: %r", e)
+        return set()
 
 def _save_subs_to_file():
-    pathlib.Path(SUBS_FILE).parent.mkdir(parents=True, exist_ok=True)
-    pathlib.Path(SUBS_FILE).write_text("\n".join(str(x) for x in sorted(SUBS)))
+    try:
+        pathlib.Path(SUBS_FILE).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(SUBS_FILE).write_text("\n".join(str(x) for x in sorted(SUBS)))
+    except Exception as e:
+        log.error("subs save failed: %r", e)
 
 async def _validate_subs(bot) -> None:
     global SUBS
@@ -325,7 +345,6 @@ def fetch_matches() -> List[dict]:
     matches=[]
     for p in uniq:
         if not passes_filters(p, now_ms):
-            # Build minimal 'm' and attempt enrichment (cases with missing age/mcap/vol).
             base_tmp = (p.get("baseToken") or {})
             mint_tmp = base_tmp.get("address") or ""
             m_try = {
@@ -344,7 +363,6 @@ def fetch_matches() -> List[dict]:
                 "gmgn": GMGN_WEB_URL.format(mint=mint_tmp) if mint_tmp else "https://gmgn.ai/",
             }
             m_try = _enrich_if_needed(m_try)
-            # Re-check with hard filter on enriched fields
             if float(m_try["liquidity_usd"]) < MIN_LIQ_USD: 
                 continue
             if (m_try.get("age_min") not in (None, float("inf"))) and (m_try["age_min"] > MAX_AGE_MIN):
@@ -353,11 +371,9 @@ def fetch_matches() -> List[dict]:
                 continue
             if m_try["vol24_usd"] > 0 and m_try["vol24_usd"] < MIN_VOL_H24_USD:
                 continue
-            # Accept enriched candidate
             matches.append(m_try)
             continue
 
-        # Normal assembly path
         base=p.get("baseToken",{}) or {}
         info=p.get("info",{}) or {}
         name  = base.get("symbol") or base.get("name") or "Unknown"
@@ -383,7 +399,6 @@ def fetch_matches() -> List[dict]:
             "tw_handle": x_handle,
             "logo_hint": logo_hint,
         }
-        # Final enrichment if needed
         m = _enrich_if_needed(m)
         matches.append(m)
 
@@ -402,13 +417,15 @@ def _load_first_seen():
         except: return {}
     return {}
 def _save_first_seen(d):
-    pathlib.Path(FIRST_SEEN_FILE).parent.mkdir(parents=True, exist_ok=True)
-    pathlib.Path(FIRST_SEEN_FILE).write_text(json.dumps(d, indent=2))
+    try:
+        pathlib.Path(FIRST_SEEN_FILE).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(FIRST_SEEN_FILE).write_text(json.dumps(d, indent=2))
+    except Exception as e:
+        log.error("save first_seen failed: %r", e)
 
 FIRST_SEEN = _load_first_seen()
 TRACKED: Set[str] = set()  # tokens to generate price updates for
-# Remember the very first pinned message per (chat, token)
-LAST_PINNED: Dict[Tuple[int, str], int] = {}
+LAST_PINNED: Dict[Tuple[int, str], int] = {}  # first pinned per (chat, token)
 
 def decorate_with_first_seen(pairs):
     changed = False
@@ -465,91 +482,66 @@ def _tw_api_get(url:str, params:Dict[str,str]) -> Optional[dict]:
         if r.status_code==200: return r.json()
     except: pass
     return None
-# NEW: static “followers” directory (free, no-API mode)
-FB_STATIC_DIR = pathlib.Path(os.path.expanduser(os.getenv("FB_STATIC_DIR", "~/telegram-bot/followers_static")))
-FB_STATIC_DIR.mkdir(parents=True, exist_ok=True)
-# --------- Nitter scraper (no Twitter API) ----------
-# Try multiple mirrors; first entry is the env-provided one (if any)
+
+# Nitter mirrors
 _NITTER_ENV = os.getenv("NITTER_BASE", "").rstrip("/")
 NITTER_MIRRORS = [m for m in [
     _NITTER_ENV or None,
     "https://nitter.net",
     "https://nitter.poast.org",
-    "https://ntrqq.com",           # extra public mirror
-    "https://n.l5.ca",             # extra public mirror
+    "https://ntrqq.com",
+    "https://n.l5.ca",
 ] if m]
 
-from typing import Optional, Dict
+_USERNAME_PATTERNS = [
+    re.compile(r'class="username"[^>]*>\s*@?<bdi>\s*([^<\s]+)\s*</bdi>', re.IGNORECASE),
+    re.compile(r'<a[^>]+class="username"[^>]+href="/([^/"]+)"', re.IGNORECASE),
+    re.compile(r'<span[^>]+class="username"[^>]*>\s*@?\s*([^<\s]+)\s*</span>', re.IGNORECASE),
+    re.compile(r'href="/([A-Za-z0-9_]{1,15})"[^>]*class="username"', re.IGNORECASE),
+]
 
 def _nitter_get_from(base: str, path: str, params: Optional[Dict[str, str]] = None) -> Optional[str]:
     try:
         url = f"{base}{path}"
         r = SESSION.get(url, params=params or {}, timeout=20)
         if r.status_code == 200 and r.text:
-            if DEBUG_FB:
-                log.info(f"[nitter] {url} OK (len={len(r.text)})")
+            if DEBUG_FB: log.info(f"[nitter] {url} OK (len={len(r.text)})")
             return r.text
-        if DEBUG_FB:
-            log.info(f"[nitter] {url} -> {r.status_code}")
+        if DEBUG_FB: log.info(f"[nitter] {url} -> {r.status_code}")
     except Exception as e:
-        if DEBUG_FB:
-            log.info(f"[nitter] fetch error {base}{path}: {e}")
+        if DEBUG_FB: log.info(f"[nitter] fetch error {base}{path}: {e}")
     return None
 
 def _nitter_get(path: str, params: Optional[Dict[str, str]] = None) -> Optional[str]:
-    # Try mirrors in order until one returns HTML
     for base in NITTER_MIRRORS:
         html = _nitter_get_from(base, path, params)
-        if html:
-            return html
+        if html: return html
     return None
-
-# patterns seen on different Nitter skins
-_USERNAME_PATTERNS = [
-    # <a class="username" href="/user"><bdi>user</bdi></a>
-    re.compile(r'class="username"[^>]*>\s*@?<bdi>\s*([^<\s]+)\s*</bdi>', re.IGNORECASE),
-    # <a href="/user" class="username">
-    re.compile(r'<a[^>]+class="username"[^>]+href="/([^/"]+)"', re.IGNORECASE),
-    # <a href="/user" ...><span class="username">@user</span>
-    re.compile(r'<span[^>]+class="username"[^>]*>\s*@?\s*([^<\s]+)\s*</span>', re.IGNORECASE),
-    # super-broad fallback: any /handle that’s immediately followed by class="username"
-    re.compile(r'href="/([A-Za-z0-9_]{1,15})"[^>]*class="username"', re.IGNORECASE),
-]
 
 def _parse_nitter_usernames(html: str) -> List[str]:
     out: List[str] = []
-    if not html:
-        return out
+    if not html: return out
     for pat in _USERNAME_PATTERNS:
         for m in pat.finditer(html):
             h = _normalize_handle(m.group(1))
-            if h:
-                out.append(h)
-    # de-dupe but keep order
-    seen = set()
-    uniq = []
+            if h: out.append(h)
+    seen = set(); uniq=[]
     for h in out:
         if h not in seen:
             uniq.append(h); seen.add(h)
     if DEBUG_FB:
-        log.info(f"[nitter] parsed {len(uniq)} usernames on page")
+        log.info(f"[nitter] parsed {len(uniq)} usernames")
     return uniq
 
 def _followers_scrape_nitter(handle: str, max_total: int = 1000, max_pages: int = 8) -> Optional[Set[str]]:
-    if not handle:
-        return None
+    if not handle: return None
 
     def _fetch_page(pg: int) -> Optional[str]:
-        # page 1: try without query first
         if pg == 1:
             html = _nitter_get(f"/{handle}/followers", params=None)
-            if html:
-                return html
-        # most common pager
+            if html: return html
         html = _nitter_get(f"/{handle}/followers", params={"page": str(pg)})
-        if html:
-            return html
-        # some instances use ?p=
+        if html: return html
         html = _nitter_get(f"/{handle}/followers", params={"p": str(pg)})
         return html
 
@@ -557,36 +549,25 @@ def _followers_scrape_nitter(handle: str, max_total: int = 1000, max_pages: int 
     for page in range(1, max_pages + 1):
         html = _fetch_page(page)
         if not html:
-            if DEBUG_FB:
-                log.info(f"[nitter] page {page}: no html")
+            if DEBUG_FB: log.info(f"[nitter] page {page}: no html")
             break
-
         low = html.lower()
         if ("rate limit" in low) or ("please try again later" in low):
-            if DEBUG_FB:
-                log.info(f"[nitter] page {page}: rate-limited")
+            if DEBUG_FB: log.info(f"[nitter] page {page}: rate-limited")
             break
-
         batch = _parse_nitter_usernames(html)
         batch = [h for h in batch if h and h != handle.lower()]
-
         before = len(seen)
-        for h in batch:
-            seen.add(h)
-
-        if DEBUG_FB:
-            log.info(f"[nitter] page {page}: +{len(seen)-before}, total={len(seen)}")
-
+        for h in batch: seen.add(h)
+        if DEBUG_FB: log.info(f"[nitter] page {page}: +{len(seen)-before}, total={len(seen)}")
         if len(seen) == before or len(seen) >= max_total:
             break
-
-        time.sleep(0.6)  # be polite
-
+        time.sleep(0.6)
     return seen if seen else None
+
 def _followers_static_load(handle: str) -> Optional[Set[str]]:
     handle = (handle or "").strip().lower()
-    if not handle:
-        return None
+    if not handle: return None
     txt = FB_STATIC_DIR / f"{handle}.txt"
     jsn = FB_STATIC_DIR / f"{handle}.json"
     try:
@@ -594,8 +575,7 @@ def _followers_static_load(handle: str) -> Optional[Set[str]]:
             out = []
             for line in txt.read_text(encoding="utf-8", errors="ignore").splitlines():
                 h = _normalize_handle(line)
-                if h:
-                    out.append(h)
+                if h: out.append(h)
             return set(out)
         if jsn.exists():
             j = json.loads(jsn.read_text(encoding="utf-8"))
@@ -606,29 +586,17 @@ def _followers_static_load(handle: str) -> Optional[Set[str]]:
     return None
 
 def fetch_followers_v2(handle: str, max_total: int = 1000) -> Optional[Set[str]]:
-    if not handle:
-        return None
-
-    # 1) static file (free, no API)
+    if not handle: return None
     static = _followers_static_load(handle)
-    if static:
-        return static
-
-    # 2) cached JSON
+    if static: return static
     cached = _followers_cache_load(handle)
-    if cached:
-        return cached
-
-    # 3) scrape from Nitter (free)
+    if cached: return cached
     scraped = _followers_scrape_nitter(handle, max_total=max_total)
     if scraped:
         _followers_cache_save(handle, scraped)
         return scraped
-
-    # 4) (optional) Twitter API if TW_BEARER provided (not used here)
     if TW_BEARER:
         return None
-
     return None
 
 def overlap_line(tw_handle: Optional[str]) -> str:
@@ -649,11 +617,6 @@ def overlap_line(tw_handle: Optional[str]) -> str:
         total += len(piece)
     s = "".join(acc).rstrip(", ")
     return s + (" , …" if len(overlap) > len(acc) else "")
-
-
-
-
-
 
 # ========= UI helpers =========
 def link_keyboard(m: dict) -> InlineKeyboardMarkup:
@@ -737,7 +700,6 @@ async def _send_or_photo(bot, chat_id:int, caption:str, kb, token:str, logo_hint
         except Exception as e:
             log.info(f"Pin attempt failed (non-fatal): {e}")
 
-    # try sending photo with keyboard; on true keyboard rejection, retry without
     for u in _logo_candidates(token, logo_hint):
         if not u: continue
         try:
@@ -768,7 +730,6 @@ async def _send_or_photo(bot, chat_id:int, caption:str, kb, token:str, logo_hint
             except Exception as e:
                 log.warning(f"send_photo bytes error: {e}")
 
-    # local fallback image
     if os.path.exists(FALLBACK_LOGO):
         try:
             with open(FALLBACK_LOGO,"rb") as f:
@@ -785,7 +746,6 @@ async def _send_or_photo(bot, chat_id:int, caption:str, kb, token:str, logo_hint
         except Exception as e:
             log.warning(f"send_photo fallback error: {e}")
 
-    # text fallback
     try:
         msg = await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML",
                                      disable_web_page_preview=True, reply_markup=kb)
@@ -811,7 +771,6 @@ async def _send_or_photo(bot, chat_id:int, caption:str, kb, token:str, logo_hint
 
 # ========= Message wrappers =========
 async def send_new_token(bot, chat_id:int, m:dict):
-    # pre-send refresh to avoid pre-/post-migration mismatch
     try:
         cur = _current_for_token(m.get("token"))
         if cur:
@@ -823,7 +782,6 @@ async def send_new_token(bot, chat_id:int, m:dict):
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
 
-    # Pin only the first time we ever pin this token in this chat
     key = (chat_id, m.get("token") or "")
     should_pin = key not in LAST_PINNED
 
@@ -834,7 +792,6 @@ async def send_new_token(bot, chat_id:int, m:dict):
 
     if should_pin and msg_id:
         LAST_PINNED[key] = msg_id
-
 
 async def send_price_update(bot, chat_id:int, m:dict):
     fb_text = "—"
@@ -867,11 +824,9 @@ async def do_trade_push(bot):
                 if float(m.get("age_min", 1e9)) >= MAX_AGE_MIN:
                     continue
 
-                # track first, then decide whether to pin
                 already_tracked = m["token"] in TRACKED
                 TRACKED.add(m["token"])
 
-                # 🔥 pin if first time OR not yet tracked this run
                 if m.get("is_first_time") or not already_tracked:
                     await send_new_token(bot, chat_id, m)  # 🔥 + pin
                     sent += 1
@@ -881,16 +836,13 @@ async def do_trade_push(bot):
     except Exception as e:
         log.exception(f"do_trade_push error: {e}")
 
-
 # ========= Jobs =========
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
     log.info(f"🔥 [tick] auto_trade fired (interval={TRADE_SUMMARY_SEC}s)")
     await do_trade_push(context.bot)
 
-
 async def updater(context: ContextTypes.DEFAULT_TYPE):
     log.info(f"🧊 [tick] updater fired (interval={UPDATE_INTERVAL_SEC}s)")
-    """Send updates every UPDATE_INTERVAL_SEC; stop after UPDATE_MAX_DURATION_MIN since first detection."""
     try:
         if not TRACKED:
             return
@@ -922,7 +874,6 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"updater job error: {e}")
 
-
 # ========= Commands =========
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global SUBS
@@ -930,7 +881,6 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s + 🧊 updates every {UPDATE_INTERVAL_SEC}s (stop after {UPDATE_MAX_DURATION_MIN} min)."
     )
-
 
 async def cmd_id(u:Update,c:ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(str(u.effective_chat.id))
@@ -951,7 +901,6 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Top/tick {TOP_N_PER_TICK or 'unlimited'} | Max alert age {int(MAX_AGE_MIN)}m | Update stop {UPDATE_MAX_DURATION_MIN}m"
     )
 
-
 async def cmd_trade(u:Update,c:ContextTypes.DEFAULT_TYPE):
     pairs = best_per_token(fetch_matches()); decorate_with_first_seen(pairs)
     sent = 0
@@ -964,7 +913,7 @@ async def cmd_trade(u:Update,c:ContextTypes.DEFAULT_TYPE):
             await send_new_token(c.bot, u.effective_chat.id, m)  # 🔥 + pin
             sent += 1
         await asyncio.sleep(0.05)
-# ========= Extra helper command =========
+
 async def cmd_fb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = (u.message.text or "").split()
     if len(args) < 2:
@@ -974,8 +923,7 @@ async def cmd_fb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     ol = overlap_line(handle)
     await u.message.reply_text(f"Overlap for @{handle}:\n{ol}")
 
-
-# ========= Main =========
+# ========= Bot application & init =========
 async def _post_init(app: Application):
     global SUBS
     SUBS = _load_subs_from_file()
@@ -984,14 +932,7 @@ async def _post_init(app: Application):
     await _validate_subs(app.bot)
     log.info(f"Subscribers: {sorted(SUBS)}")
 
-# ========= Webhook server for Cloud Run =========
-from fastapi import FastAPI, Request
-
-if not TG:
-    raise SystemExit("Missing TG token")
-
 application = Application.builder().token(TG).post_init(_post_init).build()
-
 application.add_handler(CommandHandler("start",      cmd_start))
 application.add_handler(CommandHandler("id",         cmd_id))
 application.add_handler(CommandHandler("subscribe",  cmd_sub))
@@ -1000,15 +941,20 @@ application.add_handler(CommandHandler("status",     cmd_status))
 application.add_handler(CommandHandler("trade",      cmd_trade))
 application.add_handler(CommandHandler("fb",         cmd_fb))
 
-app = FastAPI()
+# ========= FastAPI app (Cloud Run) =========
+app = FastAPI(title="Telegram Webhook")
+app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/")
-async def health():
+async def health_root():
+    return {"ok": True}
+
+@app.get("/healthz")
+async def healthz():
     return {"ok": True}
 
 @app.on_event("startup")
 async def _startup():
-    # Ensure subscriptions + first_seen cache are loaded at startup
     global SUBS, FIRST_SEEN
     SUBS = _load_subs_from_file()
     FIRST_SEEN = _load_first_seen()
@@ -1016,7 +962,6 @@ async def _startup():
     await application.initialize()
 
     jq = application.job_queue
-    # Use timedelta to ensure these are seconds, not minutes.
     jq.run_repeating(
         auto_trade,
         interval=timedelta(seconds=TRADE_SUMMARY_SEC),
@@ -1030,21 +975,50 @@ async def _startup():
         name="updates",
     )
 
-
     await application.start()
     log.info(f"Bot started with TRADE_SUMMARY_SEC={TRADE_SUMMARY_SEC}, UPDATE_INTERVAL_SEC={UPDATE_INTERVAL_SEC}")
 
 @app.on_event("shutdown")
 async def _shutdown():
-    await application.stop()
-    await application.shutdown()
+    try:
+        await application.stop()
+    finally:
+        await application.shutdown()
 
+# ---------- Webhook: tokenized path, fast reply, always 200 ----------
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
     if token != TG:
-        return {"ok": False, "reason": "token mismatch"}
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return {"ok": True}
+        return Response(status_code=403)
 
+    try:
+        data: Dict[str, Any] = await request.json()
+    except Exception as e:
+        log.warning("webhook json parse error: %r", e)
+        return Response(status_code=400)
+
+    # Fast confirm so you SEE a message even if downstream handlers fail
+    try:
+        msg = data.get("message") or {}
+        text = (msg.get("text") or "").strip().lower()
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        if chat_id and text in ("/start", "/ping", "/id", "ping"):
+            await application.bot.send_message(chat_id, "✅ Webhook round-trip OK")
+    except Exception as e:
+        log.warning("webhook fast-reply error: %r", e)
+
+    # Hand over to PTB to run registered handlers; never let exceptions cause non-200
+    try:
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+    except Exception as e:
+        log.exception("process_update error: %r", e)
+
+    return Response(status_code=200)
+
+# ---------- Local dev runner (Cloud Run uses uvicorn via Command/Args) ----------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
