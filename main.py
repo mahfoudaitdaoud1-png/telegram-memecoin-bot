@@ -961,29 +961,30 @@ async def healthz():
     return {"ok": True}
 
 @app.on_event("startup")
+@app.on_event("startup")
 async def _startup():
+    # Load local state quickly (file reads are fine)
     global SUBS, FIRST_SEEN
     SUBS = _load_subs_from_file()
     FIRST_SEEN = _load_first_seen()
 
-    await application.initialize()
+    # Fire-and-forget bot boot so the HTTP server can accept connections now
+    asyncio.create_task(_start_bot_and_jobs())
 
-    jq = application.job_queue
-    jq.run_repeating(
-        auto_trade,
-        interval=timedelta(seconds=TRADE_SUMMARY_SEC),
-        first=timedelta(seconds=3),
-        name="trade_tick",
-    )
-    jq.run_repeating(
-        updater,
-        interval=timedelta(seconds=UPDATE_INTERVAL_SEC),
-        first=timedelta(seconds=20),
-        name="updates",
-    )
 
-    await application.start()
-    log.info(f"Bot started with TRADE_SUMMARY_SEC={TRADE_SUMMARY_SEC}, UPDATE_INTERVAL_SEC={UPDATE_INTERVAL_SEC}")
+async def _start_bot_and_jobs():
+    try:
+        await application.initialize()
+        # schedule jobs AFTER init
+        jq = application.job_queue
+        jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC),
+                         first=timedelta(seconds=3), name="trade_tick")
+        jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC),
+                         first=timedelta(seconds=20), name="updates")
+        await application.start()
+        log.info("Bot initialized & started")
+    except Exception as e:
+        log.exception("Bot startup failed: %r", e)
 
 @app.on_event("shutdown")
 async def _shutdown():
