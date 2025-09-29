@@ -341,12 +341,27 @@ def fetch_matches() -> List[dict]:
     pairs += fetch_search(SEARCH_NEW_URL)
     pairs += fetch_search(SEARCH_ALL_URL)
 
-    seen_pairs=set(); uniq=[]
-    for p in pairs:
-        if not isinstance(p,dict): continue
-        k = p.get("pairAddress") or p.get("url")
-        if not k or k in seen_pairs: continue
-        seen_pairs.add(k); uniq.append(p)
+    seen_pairs: Set[str] = set()
+uniq: List[dict] = []
+
+for p in pairs:
+    if not isinstance(p, dict):
+        continue
+
+    # Try several ids; some “new” results don’t have pairAddress/url yet.
+    base = (p.get("baseToken") or {}) if isinstance(p.get("baseToken"), dict) else {}
+    mint = base.get("address") or p.get("baseTokenAddress") or p.get("tokenAddress") or ""
+
+    k = p.get("pairAddress") or p.get("url") or mint
+    if not k or k in seen_pairs:
+        continue
+
+    seen_pairs.add(k)
+    # Make sure the token address is present downstream even if the source row was sparse
+    if mint and isinstance(p.get("baseToken"), dict):
+        p["baseToken"]["address"] = mint
+    uniq.append(p)
+
 
     now_ms=time.time()*1000.0
     matches=[]
