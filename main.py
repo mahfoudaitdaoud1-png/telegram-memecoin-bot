@@ -908,18 +908,46 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Top/tick {TOP_N_PER_TICK or 'unlimited'} | Max alert age {int(MAX_AGE_MIN)}m | Update stop {UPDATE_MAX_DURATION_MIN}m"
     )
 
-async def cmd_trade(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    pairs = best_per_token(fetch_matches()); decorate_with_first_seen(pairs)
+async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    /trade            -> send ALL current matches (not only first-time)
+    /trade 5          -> send at most 5 current matches
+    """
+    args = (u.message.text or "").split()
+    manual_cap = None
+    if len(args) >= 2:
+        try:
+            manual_cap = max(1, int(args[1]))
+        except:
+            manual_cap = None
+
+    pairs = best_per_token(fetch_matches())
+    decorate_with_first_seen(pairs)
+
+    # default cap: respect TOP_N_PER_TICK if set, else unlimited
+    cap = manual_cap if manual_cap is not None else (TOP_N_PER_TICK if TOP_N_PER_TICK > 0 else 10_000)
+
     sent = 0
     for m in pairs:
-        if TOP_N_PER_TICK > 0 and sent >= TOP_N_PER_TICK: break
         if float(m.get("age_min", 1e9)) >= MAX_AGE_MIN:
             continue
+
         TRACKED.add(m["token"])
+
+        # For manual runs: send ALL matches. If it's the first time we’ve seen it,
+        # use the "new token" message (🔥 + pin on first pin for that chat).
         if m.get("is_first_time"):
-            await send_new_token(c.bot, u.effective_chat.id, m)  # 🔥 + pin
-            sent += 1
+            await send_new_token(c.bot, u.effective_chat.id, m)
+        else:
+            await send_price_update(c.bot, u.effective_chat.id, m)
+
+        sent += 1
+        if sent >= cap:
+            break
         await asyncio.sleep(0.05)
+
+    if sent == 0:
+        await u.message.reply_text("(trade) no matches with current filters.")
 
 async def cmd_fb(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = (u.message.text or "").split()
