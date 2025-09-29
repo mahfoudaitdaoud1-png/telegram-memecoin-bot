@@ -13,7 +13,11 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================= Logging =================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
 log = logging.getLogger("bot")
 log.info(f"Python runtime: {sys.version}")
 
@@ -68,6 +72,7 @@ TOKENS_URL         = "https://api.dexscreener.com/tokens/v1/{chainId}/{addresses
 SEARCH_NEW_URL     = "https://api.dexscreener.com/latest/dex/search?q=chain:solana%20new"
 SEARCH_ALL_URL     = "https://api.dexscreener.com/latest/dex/search?q=chain:solana"
 TOKEN_PAIRS_URL    = "https://api.dexscreener.com/token-pairs/v1/solana/{address}"  # used by updater & refresh
+PAIR_REFRESH_URL   = "https://api.dexscreener.com/latest/dex/pairs/solana/{pair}"   # new: refresh by pair
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": f"tg-memebot/trade-{TRADE_SUMMARY_SEC}s", "Accept": "*/*"})
@@ -294,24 +299,64 @@ def _current_for_token(token_addr: str) -> Optional[dict]:
         "tw_handle": x_handle,
     }
 
+# NEW: refresh by PAIR address (when mint is missing in search payload)
+def _current_for_pair(pair_addr: str) -> Optional[dict]:
+    if not pair_addr:
+        return None
+    j = _get_json(PAIR_REFRESH_URL.format(pair=pair_addr), timeout=15) or {}
+    arr = j.get("pairs") or []
+    if not isinstance(arr, list) or not arr:
+        return None
+    best = _choose_best_pair(arr) or arr[0]
+
+    base = best.get("baseToken", {}) or {}
+    info = best.get("info", {}) or {}
+    fdv  = best.get("fdv")
+    x_handle, x_url = _extract_x(info)
+    pair  = best.get("pairAddress") or ""
+
+    return {
+        "name": base.get("symbol") or base.get("name") or "Unknown",
+        "token": base.get("address") or "",
+        "pair": pair,
+        "price_usd": _get_price_usd(best),
+        "liquidity_usd": float((best.get("liquidity") or {}).get("usd", 0) or 0),
+        "mcap_usd": float(fdv if fdv is not None else (best.get("marketCap") or 0) or 0),
+        "vol24_usd": float((best.get("volume") or {}).get("h24", 0) or 0),
+        "age_min": _pair_age_minutes(time.time()*1000.0, best.get("pairCreatedAt")),
+        "url": _valid_url(best.get("url") or f"https://dexscreener.com/{CHAIN_ID}/{pair}"),
+        "logo_hint": info.get("imageUrl") or base.get("logo") or "",
+        "axiom": AXIOM_WEB_URL.format(pair=pair) if pair else "https://axiom.trade/",
+        "gmgn": GMGN_WEB_URL.format(mint=base.get("address","")) if base.get("address") else "https://gmgn.ai/",
+        "tw_url": _valid_url(x_url) or "https://x.com/",
+        "tw_handle": x_handle,
+    }
+
 # ---------- Enrichment helpers ----------
 def _enrich_if_needed(m: dict) -> dict:
-    """Refresh from TOKEN_PAIRS_URL when any key metric is missing or liq is below threshold."""
+    """Refresh when any key metric is missing/low.
+       If token (mint) is missing, fall back to pair-based refresh.
+    """
     need_age = (m.get("age_min") in (None, float("inf")))
     need_mcap = float(m.get("mcap_usd") or 0) <= 0
-    need_vol = float(m.get("vol24_usd") or 0) <= 0
-    # NEW: if liquidity is below your filter, try to refresh before judging
-    need_liq = float(m.get("liquidity_usd") or 0) < MIN_LIQ_USD
+    need_vol  = float(m.get("vol24_usd") or 0) <= 0
+    need_liq  = float(m.get("liquidity_usd") or 0) < MIN_LIQ_USD
+    missing_token = not (m.get("token") or "").strip()
 
-    if not (need_age or need_mcap or need_vol or need_liq):
+    if not (need_age or need_mcap or need_vol or need_liq or missing_token):
         return m
 
-    cur = _current_for_token(m.get("token"))
+    cur: Optional[dict] = None
+    if m.get("token"):
+        cur = _current_for_token(m.get("token"))
+    if not cur and m.get("pair"):
+        cur = _current_for_pair(m.get("pair"))
+
     if not cur:
         return m
 
     for k in ("pair","price_usd","liquidity_usd","mcap_usd","vol24_usd",
-              "age_min","url","logo_hint","tw_url","tw_handle"):
+              "age_min","url","logo_hint","tw_url","tw_handle","token","name"):
         if cur.get(k) is not None:
             m[k] = cur[k]
     return m
@@ -779,7 +824,9 @@ async def _send_or_photo(bot, chat_id:int, caption:str, kb, token:str, logo_hint
 # ========= Message wrappers =========
 async def send_new_token(bot, chat_id:int, m:dict):
     try:
-        cur = _current_for_token(m.get("token"))
+        cur = _current_for_token(m.get("token")) if m.get("token") else None
+        if not cur and m.get("pair"):
+            cur = _current_for_pair(m.get("pair"))
         if cur:
             m = _merge_current(m, cur)
     except Exception as e:
@@ -829,8 +876,7 @@ async def do_trade_push(bot):
                 if TOP_N_PER_TICK > 0 and sent >= TOP_N_PER_TICK:
                     break
                 if (m.get("age_min") not in (None, float("inf"))) and (m["age_min"] > MAX_AGE_MIN):
-    continue
-
+                    continue
 
                 already_tracked = m["token"] in TRACKED
                 TRACKED.add(m["token"])
@@ -869,9 +915,8 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             if (current.get("age_min") not in (None, float("inf"))) and (current["age_min"] > MAX_AGE_MIN):
-    TRACKED.discard(token)
-    continue
-
+                TRACKED.discard(token)
+                continue
 
             first_mcap = float(first_rec.get("first", 0.0))
             current["first_mcap_usd"] = first_mcap
@@ -926,19 +971,15 @@ async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
     pairs = best_per_token(fetch_matches())
     decorate_with_first_seen(pairs)
 
-    # default cap: respect TOP_N_PER_TICK if set, else unlimited
     cap = manual_cap if manual_cap is not None else (TOP_N_PER_TICK if TOP_N_PER_TICK > 0 else 10_000)
 
     sent = 0
     for m in pairs:
-        for m in pairs:
-    if (m.get("age_min") not in (None, float("inf"))) and (m["age_min"] > MAX_AGE_MIN):
-        continue
+        if (m.get("age_min") not in (None, float("inf"))) and (m["age_min"] > MAX_AGE_MIN):
+            continue
 
         TRACKED.add(m["token"])
 
-        # For manual runs: send ALL matches. If it's the first time we’ve seen it,
-        # use the "new token" message (🔥 + pin on first pin for that chat).
         if m.get("is_first_time"):
             await send_new_token(c.bot, u.effective_chat.id, m)
         else:
@@ -992,21 +1033,15 @@ async def healthz():
     return {"ok": True}
 
 @app.on_event("startup")
-@app.on_event("startup")
 async def _startup():
-    # Load local state quickly (file reads are fine)
     global SUBS, FIRST_SEEN
     SUBS = _load_subs_from_file()
     FIRST_SEEN = _load_first_seen()
-
-    # Fire-and-forget bot boot so the HTTP server can accept connections now
     asyncio.create_task(_start_bot_and_jobs())
-
 
 async def _start_bot_and_jobs():
     try:
         await application.initialize()
-        # schedule jobs AFTER init
         jq = application.job_queue
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC),
                          first=timedelta(seconds=3), name="trade_tick")
@@ -1036,7 +1071,7 @@ async def telegram_webhook(token: str, request: Request):
         log.warning("webhook json parse error: %r", e)
         return Response(status_code=400)
 
-    # Fast confirm so you SEE a message even if downstream handlers fail
+    # Fast confirm
     try:
         msg = data.get("message") or {}
         text = (msg.get("text") or "").strip().lower()
@@ -1047,7 +1082,6 @@ async def telegram_webhook(token: str, request: Request):
     except Exception as e:
         log.warning("webhook fast-reply error: %r", e)
 
-    # Hand over to PTB to run registered handlers; never let exceptions cause non-200
     try:
         update = Update.de_json(data, application.bot)
         await application.process_update(update)
