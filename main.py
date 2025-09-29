@@ -828,8 +828,9 @@ async def do_trade_push(bot):
             for m in pairs:
                 if TOP_N_PER_TICK > 0 and sent >= TOP_N_PER_TICK:
                     break
-                if float(m.get("age_min", 1e9)) >= MAX_AGE_MIN:
-                    continue
+                if (m.get("age_min") not in (None, float("inf"))) and (m["age_min"] > MAX_AGE_MIN):
+    continue
+
 
                 already_tracked = m["token"] in TRACKED
                 TRACKED.add(m["token"])
@@ -867,9 +868,10 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
             if not current:
                 continue
 
-            if float(current.get("age_min", 1e9)) >= MAX_AGE_MIN:
-                TRACKED.discard(token)
-                continue
+            if (current.get("age_min") not in (None, float("inf"))) and (current["age_min"] > MAX_AGE_MIN):
+    TRACKED.discard(token)
+    continue
+
 
             first_mcap = float(first_rec.get("first", 0.0))
             current["first_mcap_usd"] = first_mcap
@@ -929,8 +931,9 @@ async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     sent = 0
     for m in pairs:
-        if float(m.get("age_min", 1e9)) >= MAX_AGE_MIN:
-            continue
+        for m in pairs:
+    if (m.get("age_min") not in (None, float("inf"))) and (m["age_min"] > MAX_AGE_MIN):
+        continue
 
         TRACKED.add(m["token"])
 
