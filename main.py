@@ -1272,6 +1272,245 @@ async def cmd_xscan(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await wait.delete()
         except Exception:
             pass
+# ========== /xscan — Community/Profile scraper (no API) ==========
+# Uses reader-view snapshots (jina) and basic regex parsing.
+
+READER_PREFIXES = [
+    "https://r.jina.ai/http://",
+    "https://r.jina.ai/https://",
+]
+HEADERS_XREAD = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+READ_TIMEOUT = 25
+SLEEP_REQ = 0.20
+
+PAT_CANON = re.compile(r"https?://(?:x\.com|twitter\.com)/([A-Za-z0-9_]{1,15})/status/(\d+)", re.I)
+PAT_I_WEB = re.compile(r"https?://(?:x\.com|twitter\.com)/i/(?:web/)?status/(\d+)", re.I)
+PAT_ANY_STATUS = re.compile(r"https?://(?:x\.com|twitter\.com)/(?:[^/\s]+/)?status/(\d+)", re.I)
+USER_PAT = re.compile(r"@([A-Za-z0-9_]{1,15})\b")
+
+def _http_get(url: str) -> requests.Response:
+    return requests.get(url, headers=HEADERS_XREAD, timeout=READ_TIMEOUT)
+
+def _fetch_readable(url: str) -> str:
+    last_err = None
+    short = url.replace("https://", "").replace("http://", "")
+    for pref in READER_PREFIXES:
+        try:
+            r = _http_get(pref + short)
+            if r.status_code == 200 and r.text and len(r.text) > 500:
+                return r.text
+            last_err = f"HTTP {r.status_code} len={len(r.text) if r.text else 0}"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(SLEEP_REQ)
+    raise RuntimeError(f"Readable fetch failed: {last_err}")
+
+def _is_community(u: str) -> bool:
+    try:
+        p = urlparse(u)
+        return "/i/communities/" in (p.path or "")
+    except:
+        return False
+
+def _is_profile(u: str) -> bool:
+    try:
+        p = urlparse(u)
+        parts = [s for s in (p.path or "").split("/") if s]
+        return (p.netloc or "").lower().endswith(("x.com","twitter.com")) and len(parts) == 1
+    except:
+        return False
+
+def _handle_from_profile_url(u: str) -> str | None:
+    try:
+        p = urlparse(u)
+        parts = [s for s in (p.path or "").split("/") if s]
+        h = parts[0] if parts else ""
+        return h if re.fullmatch(r"[A-Za-z0-9_]{1,15}", h or "") else None
+    except:
+        return None
+
+def _canonical_status(url: str) -> str | None:
+    m = PAT_CANON.search(url)
+    if not m: return None
+    return f"https://x.com/{m.group(1)}/status/{m.group(2)}"
+
+def _extract_all_statuses(text: str) -> list[str]:
+    # canonical
+    urls = [f"https://x.com/{m.group(1)}/status/{m.group(2)}" for m in PAT_CANON.finditer(text)]
+    # /i/(web/)status (no username) → resolve by opening the tweet page (reader) and looking for canonical
+    for m in PAT_I_WEB.finditer(text):
+        raw = m.group(0)
+        try:
+            t = _fetch_readable(raw)
+            m2 = PAT_CANON.search(t)
+            if m2:
+                urls.append(f"https://x.com/{m2.group(1)}/status/{m2.group(2)}")
+        except Exception:
+            pass
+        time.sleep(0.12)
+    # loose fallback for odd shapes
+    for m in PAT_ANY_STATUS.finditer(text):
+        seg = text[m.start():m.end()]
+        if "i/status" in seg or "i/web/status" in seg:
+            continue
+        can = _canonical_status(seg)
+        if can:
+            urls.append(can)
+    # unique preserve
+    seen = set(); out=[]
+    for u in urls:
+        if u not in seen:
+            seen.add(u); out.append(u)
+    return out
+
+def _group_by_user(urls: list[str]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for u in urls:
+        m = PAT_CANON.match(u)
+        if not m: continue
+        user = m.group(1)
+        out.setdefault(user, [])
+        if u not in out[user]:
+            out[user].append(u)
+    return out
+
+def _load_my_handles() -> set[str]:
+    path = os.getenv("MY_FOLLOWING_TXT", "handles.partial.txt")
+    s: set[str] = set()
+    try:
+        for line in open(path, "r", encoding="utf-8", errors="ignore"):
+            h = (line or "").strip().lstrip("@")
+            if re.fullmatch(r"[A-Za-z0-9_]{1,15}", h or ""):
+                s.add(h.lower())
+    except Exception:
+        pass
+    return s
+
+def _render_clickable_handles(handles: list[str]) -> str:
+    # produce "@name" as <a href="https://x.com/name">@name</a>
+    return ", ".join([f'<a href="https://x.com/{h}">@{h}</a>' for h in handles])
+
+def _chunk_and_send(bot, chat_id: int, html: str, max_len: int = 3800):
+    # Telegram hard cap is 4096; keep some margin for safety
+    i = 0
+    while i < len(html):
+        j = min(len(html), i + max_len)
+        # try to break on line boundary
+        cut = html.rfind("\n", i, j)
+        if cut <= i: cut = j
+        piece = html[i:cut]
+        bot.send_message(chat_id, piece, parse_mode="HTML", disable_web_page_preview=True)
+        i = cut
+
+async def cmd_xscan(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    args = (u.message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await u.message.reply_text("Usage: /xscan <community or profile URL>")
+        return
+    target = args[1].strip()
+    await u.message.chat.send_action("typing")
+
+    # 1) Fetch a good snapshot
+    variants = [target]
+    if _is_community(target):
+        # try desktop, mobile, and ?f=live
+        try:
+            p = urlparse(target); cid = [s for s in (p.path or "").split("/") if s][2]
+            bases = [
+                f"https://x.com/i/communities/{cid}",
+                f"https://twitter.com/i/communities/{cid}",
+                f"https://mobile.twitter.com/i/communities/{cid}",
+                f"https://x.com/i/communities/{cid}?f=live",
+                f"https://twitter.com/i/communities/{cid}?f=live",
+                f"https://mobile.twitter.com/i/communities/{cid}?f=live",
+            ]
+            seen=set(); variants=[b for b in bases if not (b in seen or seen.add(b))]
+        except Exception:
+            pass
+
+    best = None
+    for v in variants:
+        try:
+            txt = _fetch_readable(v)
+            if best is None or len(txt) > len(best):
+                best = txt
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+
+    if not best:
+        await u.message.reply_text("Could not fetch a readable snapshot for that URL.")
+        return
+
+    # 2) Extract & group
+    status_urls = _extract_all_statuses(best)
+    by_user = _group_by_user(status_urls)
+
+    # Profile pages may return empty (timeline not in reader). If profile: add a minimal fallback
+    if not by_user and _is_profile(target):
+        handle = _handle_from_profile_url(target)
+        # Try to pick any status links in page even if posted by others; filter by this handle as author
+        for m in PAT_CANON.finditer(best or ""):
+            if m.group(1).lower() == (handle or "").lower():
+                url = f"https://x.com/{m.group(1)}/status/{m.group(2)}"
+                by_user.setdefault(handle, [])
+                if url not in by_user[handle]:
+                    by_user[handle].append(url)
+
+    # 3) Compare with "my following"
+    my_set = _load_my_handles()
+    followed = []
+    extras = []
+    for user in by_user.keys():
+        (followed if user.lower() in my_set else extras).append(user)
+
+    followed.sort(key=str.lower)
+    extras.sort(key=str.lower)
+
+    # Limits from env
+    MAX_USERS_PER_SECTION = int(os.getenv("MAX_USERS_PER_SECTION", "50"))
+    MAX_SOURCE_LINKS_PER_USER = int(os.getenv("MAX_SOURCE_LINKS_PER_USER", "3"))
+
+    f_show = followed[:MAX_USERS_PER_SECTION]
+    e_show = extras[:MAX_USERS_PER_SECTION]
+
+    # 4) Build HTML message
+    lines = []
+    lines.append("<b>Followed by</b>")
+    lines.append(_render_clickable_handles(f_show) if f_show else "—")
+    if len(followed) > len(f_show):
+        lines.append(f"... +{len(followed) - len(f_show)} more")
+    lines.append("")
+
+    lines.append("<b>Extras</b>")
+    lines.append(_render_clickable_handles(e_show) if e_show else "—")
+    if len(extras) > len(e_show):
+        lines.append(f"... +{len(extras) - len(e_show)} more")
+    lines.append("")
+
+    lines.append("<b>Source</b>")
+    # show a compact per-user list with limited links
+    users_in_order = sorted(by_user.keys(), key=str.lower)
+    for user in users_in_order:
+        urls = by_user[user][:MAX_SOURCE_LINKS_PER_USER]
+        uhtml = f'<a href="https://x.com/{user}">@{user}</a>'
+        if urls:
+            links = " • ".join([f'<a href="{x}">post</a>' for x in urls])
+            lines.append(f"• {uhtml}: {links}")
+        else:
+            lines.append(f"• {uhtml}: —")
+    html = "\n".join(lines)
+
+    # 5) Send (chunked if needed)
+    try:
+        _chunk_and_send(c.bot, u.effective_chat.id, html, max_len=int(os.getenv("MAX_MESSAGE_CHARS", "3500")))
+    except Exception as e:
+        await u.message.reply_text(f"Error sending message: {e}")
 
 # ============================================================================
 #                        FASTAPI + TELEGRAM LIFECYCLE
