@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Integrated Memecoin Bot with Twitter Community/Profile Scraper
-Combines Dexscreener monitoring with Twitter scraping for follower analysis
+Twitter scraping only runs on first detection (fire emoji alerts)
+All updates reuse cached data for performance
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ INGEST_INTERVAL_SEC     = int(os.getenv("INGEST_INTERVAL_SEC", "12"))
 
 # Twitter scraper config
 TWITTER_SCRAPER_ENABLED = os.getenv("TWITTER_SCRAPER_ENABLED", "1") == "1"
-TWITTER_SCRAPE_TIMEOUT  = int(os.getenv("TWITTER_SCRAPE_TIMEOUT", "30"))
+TWITTER_SCRAPE_TIMEOUT  = int(os.getenv("TWITTER_SCRAPE_TIMEOUT", "60"))
 TWITTER_MAX_FOLLOWERS   = int(os.getenv("TWITTER_MAX_FOLLOWERS", "200"))
 
 MIN_LIQ_USD     = float(os.getenv("MIN_LIQ_USD",     "35000"))
@@ -82,7 +83,7 @@ READER_SERVICES = [
 ]
 
 # -----------------------------------------------------------------------------
-# Twitter Scraper
+# Twitter Scraper - WITH PERSISTENT CACHING
 # -----------------------------------------------------------------------------
 class TwitterPatternMatcher:
     def __init__(self):
@@ -125,7 +126,9 @@ class TwitterScraper:
         p = pathlib.Path(TWITTER_CACHE_JSON)
         if p.exists():
             try:
-                return json.loads(p.read_text())
+                data = json.loads(p.read_text())
+                log.info(f"[Twitter] Loaded cache with {len(data)} entries")
+                return data
             except:
                 return {}
         return {}
@@ -133,35 +136,57 @@ class TwitterScraper:
     def _save_cache(self):
         try:
             pathlib.Path(TWITTER_CACHE_JSON).write_text(json.dumps(self.cache, indent=2))
-        except:
-            pass
+            log.info(f"[Twitter] Saved cache with {len(self.cache)} entries")
+        except Exception as e:
+            log.error(f"[Twitter] Cache save failed: {e}")
     
-    def _fetch_readable(self, url: str) -> Optional[str]:
-        cache_key = url.lower()
+    def _get_cache_key(self, url: str) -> str:
+        """Normalize URL to cache key"""
+        url = url.lower()
+        # Extract community ID or username
+        if '/i/communities/' in url:
+            match = re.search(r'/i/communities/(\d+)', url)
+            if match:
+                return f"community_{match.group(1)}"
+        else:
+            match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url, re.I)
+            if match:
+                return f"profile_{match.group(1).lower()}"
+        return url
+    
+    def get_cached_usernames(self, url: str) -> Optional[Set[str]]:
+        """Get cached usernames if available and fresh"""
+        cache_key = self._get_cache_key(url)
         if cache_key in self.cache:
             cached = self.cache[cache_key]
-            if isinstance(cached, dict) and cached.get('content'):
+            if isinstance(cached, dict):
                 age = time.time() - cached.get('timestamp', 0)
-                if age < 3600:
-                    return cached['content']
-        
+                if age < 3600:  # 1 hour cache
+                    usernames = set(cached.get('usernames', []))
+                    log.info(f"[Twitter] Cache HIT for {cache_key}: {len(usernames)} usernames (age: {int(age)}s)")
+                    return usernames
+                else:
+                    log.info(f"[Twitter] Cache EXPIRED for {cache_key} (age: {int(age)}s)")
+        return None
+    
+    def _fetch_readable(self, url: str) -> Optional[str]:
+        """Fetch URL via reader services"""
         if self.successful_service:
             result = self._try_service(url, self.successful_service)
             if result:
-                self._cache_content(cache_key, result)
                 return result
         
         for service in READER_SERVICES:
             result = self._try_service(url, service)
             if result:
                 self.successful_service = service
-                self._cache_content(cache_key, result)
                 return result
             time.sleep(0.3)
         
         return None
     
     def _try_service(self, url: str, service: Dict) -> Optional[str]:
+        """Try fetching with specific service"""
         try:
             if service['prefix']:
                 clean_url = url.replace('https://', '').replace('http://', '')
@@ -169,22 +194,31 @@ class TwitterScraper:
             else:
                 fetch_url = url
             
+            log.info(f"[Twitter] Trying {service['name']}: {fetch_url[:80]}...")
             response = SESSION.get(fetch_url, timeout=TWITTER_SCRAPE_TIMEOUT)
+            
             if response.status_code == 200 and len(response.text) > 500:
+                log.info(f"[Twitter] {service['name']} success: {len(response.text)} chars")
                 return response.text
-        except:
-            pass
+            else:
+                log.warning(f"[Twitter] {service['name']} returned {response.status_code}, length {len(response.text)}")
+        except Exception as e:
+            log.warning(f"[Twitter] {service['name']} error: {e}")
+        
         return None
     
-    def _cache_content(self, key: str, content: str):
-        self.cache[key] = {'content': content, 'timestamp': time.time()}
-        self._save_cache()
-    
-    def scrape_url(self, url: str) -> Set[str]:
+    def scrape_url(self, url: str, use_cache: bool = True) -> Set[str]:
+        """Scrape URL for usernames with caching"""
         if not TWITTER_SCRAPER_ENABLED or not url:
             return set()
         
-        log.info(f"[Twitter] Scraping: {url}")
+        # Check cache first
+        if use_cache:
+            cached = self.get_cached_usernames(url)
+            if cached is not None:
+                return cached
+        
+        log.info(f"[Twitter] Scraping (cache miss): {url}")
         
         variants = []
         if '/i/communities/' in url:
@@ -222,10 +256,23 @@ class TwitterScraper:
                 log.warning(f"[Twitter] Variant {i+1} failed to fetch")
             time.sleep(0.5)
         
+        # Save to cache
+        if all_usernames:
+            cache_key = self._get_cache_key(url)
+            self.cache[cache_key] = {
+                'usernames': sorted(all_usernames),
+                'timestamp': time.time()
+            }
+            self._save_cache()
+            log.info(f"[Twitter] Cached {len(all_usernames)} usernames for {cache_key}")
+        
         log.info(f"[Twitter] Total unique usernames: {len(all_usernames)}")
         return all_usernames
 
 twitter_scraper = TwitterScraper()
+
+# Session cache for Twitter results (in-memory, resets on restart)
+TWITTER_SESSION_CACHE: Dict[str, Tuple[List[str], List[str]]] = {}
 
 # -----------------------------------------------------------------------------
 # My Following List
@@ -233,6 +280,7 @@ twitter_scraper = TwitterScraper()
 def load_my_following() -> Set[str]:
     p = pathlib.Path(MY_FOLLOWING_TXT)
     if not p.exists():
+        log.warning(f"[Handles] File not found: {MY_FOLLOWING_TXT}")
         return set()
     out = set()
     try:
@@ -242,27 +290,41 @@ def load_my_following() -> Set[str]:
                 h = h[1:]
             if h and len(h) <= 15:
                 out.add(h)
-    except:
-        pass
+        log.info(f"[Handles] Loaded {len(out)} handles from {MY_FOLLOWING_TXT}")
+    except Exception as e:
+        log.error(f"[Handles] Load error: {e}")
     return out
 
 MY_HANDLES = load_my_following()
 
-def analyze_twitter_overlap(tw_url: Optional[str]) -> Tuple[List[str], List[str]]:
+def analyze_twitter_overlap(tw_url: Optional[str], is_first_time: bool = False) -> Tuple[List[str], List[str]]:
     """
     Returns (followed_by, extras)
-    followed_by: usernames that match MY_HANDLES
-    extras: other usernames found
+    Only scrapes on first_time=True, otherwise uses cache
     """
     if not tw_url or not TWITTER_SCRAPER_ENABLED:
-        log.debug(f"[Twitter] Skipped: url={tw_url}, enabled={TWITTER_SCRAPER_ENABLED}")
+        return ([], [])
+    
+    # Check session cache first
+    cache_key = twitter_scraper._get_cache_key(tw_url)
+    if cache_key in TWITTER_SESSION_CACHE:
+        log.info(f"[Twitter] Session cache HIT for {cache_key}")
+        return TWITTER_SESSION_CACHE[cache_key]
+    
+    # Only scrape on first detection
+    if not is_first_time:
+        log.info(f"[Twitter] Skipping scrape (not first time) for {tw_url}")
         return ([], [])
     
     try:
-        scraped_users = twitter_scraper.scrape_url(tw_url)
+        log.info(f"[Twitter] Starting FIRST-TIME analysis for: {tw_url}")
+        scraped_users = twitter_scraper.scrape_url(tw_url, use_cache=True)
+        
         if not scraped_users:
             log.warning(f"[Twitter] No users found for: {tw_url}")
-            return ([], [])
+            result = ([], [])
+            TWITTER_SESSION_CACHE[cache_key] = result
+            return result
         
         followed_by = []
         extras = []
@@ -273,11 +335,16 @@ def analyze_twitter_overlap(tw_url: Optional[str]) -> Tuple[List[str], List[str]
             else:
                 extras.append(user)
         
-        log.info(f"[Twitter] Analysis complete: {len(followed_by)} followed, {len(extras)} extras")
-        return (followed_by[:50], extras[:50])
+        result = (followed_by[:50], extras[:50])
+        TWITTER_SESSION_CACHE[cache_key] = result
+        
+        log.info(f"[Twitter] Analysis complete: {len(followed_by)} followed, {len(extras)} extras from {len(scraped_users)} total")
+        return result
     except Exception as e:
-        log.error(f"[Twitter] analyze_twitter_overlap error: {e}")
-        return ([], [])
+        log.error(f"[Twitter] analyze_twitter_overlap error: {e}", exc_info=True)
+        result = ([], [])
+        TWITTER_SESSION_CACHE[cache_key] = result
+        return result
 
 # -----------------------------------------------------------------------------
 # Subs
@@ -329,6 +396,22 @@ def _pair_age_minutes(now_ms, created_ms):
     except:
         return float("inf")
 
+def _canon_url(u: Optional[str]) -> Optional[str]:
+    if not u:
+        return None
+    u = u.strip()
+    if u.startswith("//"):
+        u = "https:" + u
+    if not (u.startswith("http://") or u.startswith("https://")):
+        u = "https://" + u
+    return u
+
+_URL_OK = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+
+def _valid_url(u: Optional[str]) -> Optional[str]:
+    u = _canon_url(u)
+    return u if (u and _URL_OK.match(u)) else None
+
 def _get_price_usd(p: dict) -> float:
     v = p.get("priceUsd")
     if v is None and isinstance(p.get("price"), dict):
@@ -342,7 +425,6 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
     if not isinstance(info, dict):
         return (None, None)
     
-    # Try socials/links/websites arrays
     for key in ("socials", "links", "websites"):
         arr = info.get(key)
         if isinstance(arr, list):
@@ -354,18 +436,15 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                 handle = it.get("handle")
                 
                 if url and ("twitter" in url.lower() or "x.com" in url.lower() or "twitter" in plat or "x" == plat):
-                    # Ensure URL is properly formatted
                     if not url.startswith("http"):
                         url = f"https://{url}"
                     
-                    # Extract handle from URL or use provided handle
                     handle_match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url, re.I)
                     h = handle_match.group(1) if handle_match else (handle.strip().lstrip("@") if handle else None)
                     
                     if h:
                         return (h.lower(), url)
     
-    # Try direct keys
     for key in ("twitterUrl", "twitter", "x", "twitterHandle"):
         v = info.get(key)
         if isinstance(v, str) and v.strip():
@@ -379,7 +458,6 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                 if h:
                     return (h.lower(), v)
             else:
-                # It's just a handle
                 h = v.lstrip("@").lower()
                 if h and len(h) <= 15:
                     return (h, f"https://x.com/{h}")
@@ -676,13 +754,15 @@ def passes_filters_for_alert(m: dict) -> bool:
         return False
 
 async def send_new_token(bot, chat_id: int, m: dict):
-    followed_by, extras = analyze_twitter_overlap(m.get("tw_url"))
+    """Send new token alert - SCRAPES TWITTER"""
+    followed_by, extras = analyze_twitter_overlap(m.get("tw_url"), is_first_time=True)
     caption = build_caption(m, followed_by, extras, is_update=False)
     kb = link_keyboard(m)
     await _send_or_photo(bot, chat_id, caption, kb, token=m.get("token"), logo_hint=m.get("logo_hint"))
 
 async def send_price_update(bot, chat_id: int, m: dict):
-    followed_by, extras = analyze_twitter_overlap(m.get("tw_url"))
+    """Send price update - USES CACHED TWITTER DATA"""
+    followed_by, extras = analyze_twitter_overlap(m.get("tw_url"), is_first_time=False)
     caption = build_caption(m, followed_by, extras, is_update=True)
     kb = link_keyboard(m)
     await _send_or_photo(bot, chat_id, caption, kb, token=m.get("token"), logo_hint=m.get("logo_hint"))
@@ -783,7 +863,7 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     _save_subs_to_file()
     await u.message.reply_text(
         f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s + 🧊 updates every {UPDATE_INTERVAL_SEC}s\n"
-        f"Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}"
+        f"Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'} (FIRST DETECTION ONLY)"
     )
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -806,7 +886,8 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(
         f"Subscribers: {len(SUBS)} | 🔥 /trade every {TRADE_SUMMARY_SEC}s | 🧊 updates every {UPDATE_INTERVAL_SEC}s\n"
         f"Mirror -> tokens: {s['tokens']} | My following: {len(MY_HANDLES)}\n"
-        f"Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}"
+        f"Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n"
+        f"Session cache: {len(TWITTER_SESSION_CACHE)} URLs cached"
     )
 
 async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -856,7 +937,7 @@ async def cmd_scrape(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(f"🔍 Scraping {url}...")
     
     try:
-        usernames = twitter_scraper.scrape_url(url)
+        usernames = twitter_scraper.scrape_url(url, use_cache=False)
         followed_by = [h for h in usernames if h in MY_HANDLES]
         extras = [h for h in usernames if h not in MY_HANDLES]
         
@@ -900,6 +981,13 @@ async def cmd_handles(u: Update, c: ContextTypes.DEFAULT_TYPE):
     
     await u.message.reply_text(response)
 
+async def cmd_clearcache(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Clear Twitter session cache"""
+    global TWITTER_SESSION_CACHE
+    count = len(TWITTER_SESSION_CACHE)
+    TWITTER_SESSION_CACHE.clear()
+    await u.message.reply_text(f"🗑️ Cleared {count} cached Twitter results")
+
 # -----------------------------------------------------------------------------
 # Bot Application
 # -----------------------------------------------------------------------------
@@ -916,6 +1004,7 @@ async def _post_init(app: Application):
     log.info(f"Subscribers: {sorted(SUBS)}")
     log.info(f"Following: {len(MY_HANDLES)} handles")
     log.info(f"Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
+    log.info(f"Scraper mode: FIRST DETECTION ONLY (with caching)")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
 application.add_handler(CommandHandler("start", cmd_start))
@@ -927,6 +1016,7 @@ application.add_handler(CommandHandler("trade", cmd_trade))
 application.add_handler(CommandHandler("mirror", cmd_mirror))
 application.add_handler(CommandHandler("scrape", cmd_scrape))
 application.add_handler(CommandHandler("handles", cmd_handles))
+application.add_handler(CommandHandler("clearcache", cmd_clearcache))
 
 # -----------------------------------------------------------------------------
 # FastAPI + Webhook
@@ -936,7 +1026,7 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/")
 async def health_root():
-    return {"ok": True, "twitter_scraper": TWITTER_SCRAPER_ENABLED}
+    return {"ok": True, "twitter_scraper": TWITTER_SCRAPER_ENABLED, "mode": "first_detection_only"}
 
 @app.get("/healthz")
 async def healthz():
