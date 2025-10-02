@@ -184,7 +184,7 @@ class TwitterScraper:
         if not TWITTER_SCRAPER_ENABLED or not url:
             return set()
         
-        log.info(f"[Twitter] Scraping: {url[:60]}...")
+        log.info(f"[Twitter] Scraping: {url}")
         
         variants = []
         if '/i/communities/' in url:
@@ -194,28 +194,35 @@ class TwitterScraper:
                 variants = [
                     f"https://x.com/i/communities/{cid}",
                     f"https://x.com/i/communities/{cid}?f=live",
+                    f"https://twitter.com/i/communities/{cid}",
                 ]
-        elif re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url):
-            match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url)
+        elif re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url, re.I):
+            match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url, re.I)
             username = match.group(1)
-            variants = [
-                f"https://x.com/{username}",
-                f"https://x.com/{username}/with_replies",
-            ]
+            if username not in ['i', 'home', 'explore', 'search']:
+                variants = [
+                    f"https://x.com/{username}",
+                    f"https://x.com/{username}/with_replies",
+                    f"https://twitter.com/{username}",
+                ]
         else:
             variants = [url]
         
         all_usernames = set()
-        for variant in variants[:3]:
+        for i, variant in enumerate(variants[:3]):
+            log.info(f"[Twitter] Trying variant {i+1}/{len(variants[:3])}: {variant}")
             content = self._fetch_readable(variant)
             if content:
                 usernames = self.matcher.extract_usernames(content)
                 all_usernames.update(usernames)
+                log.info(f"[Twitter] Variant {i+1} found {len(usernames)} usernames")
                 if len(all_usernames) >= TWITTER_MAX_FOLLOWERS:
                     break
+            else:
+                log.warning(f"[Twitter] Variant {i+1} failed to fetch")
             time.sleep(0.5)
         
-        log.info(f"[Twitter] Found {len(all_usernames)} usernames")
+        log.info(f"[Twitter] Total unique usernames: {len(all_usernames)}")
         return all_usernames
 
 twitter_scraper = TwitterScraper()
@@ -248,22 +255,29 @@ def analyze_twitter_overlap(tw_url: Optional[str]) -> Tuple[List[str], List[str]
     extras: other usernames found
     """
     if not tw_url or not TWITTER_SCRAPER_ENABLED:
+        log.debug(f"[Twitter] Skipped: url={tw_url}, enabled={TWITTER_SCRAPER_ENABLED}")
         return ([], [])
     
-    scraped_users = twitter_scraper.scrape_url(tw_url)
-    if not scraped_users:
+    try:
+        scraped_users = twitter_scraper.scrape_url(tw_url)
+        if not scraped_users:
+            log.warning(f"[Twitter] No users found for: {tw_url}")
+            return ([], [])
+        
+        followed_by = []
+        extras = []
+        
+        for user in sorted(scraped_users):
+            if user in MY_HANDLES:
+                followed_by.append(user)
+            else:
+                extras.append(user)
+        
+        log.info(f"[Twitter] Analysis complete: {len(followed_by)} followed, {len(extras)} extras")
+        return (followed_by[:50], extras[:50])
+    except Exception as e:
+        log.error(f"[Twitter] analyze_twitter_overlap error: {e}")
         return ([], [])
-    
-    followed_by = []
-    extras = []
-    
-    for user in sorted(scraped_users):
-        if user in MY_HANDLES:
-            followed_by.append(user)
-        else:
-            extras.append(user)
-    
-    return (followed_by[:50], extras[:50])
 
 # -----------------------------------------------------------------------------
 # Subs
@@ -328,6 +342,7 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
     if not isinstance(info, dict):
         return (None, None)
     
+    # Try socials/links/websites arrays
     for key in ("socials", "links", "websites"):
         arr = info.get(key)
         if isinstance(arr, list):
@@ -336,21 +351,38 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                     continue
                 url = it.get("url") or it.get("link")
                 plat = (it.get("platform") or it.get("type") or "").lower()
+                handle = it.get("handle")
+                
                 if url and ("twitter" in url.lower() or "x.com" in url.lower() or "twitter" in plat or "x" == plat):
-                    handle_match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url)
-                    handle = handle_match.group(1) if handle_match else None
-                    return (handle.lower() if handle else None, url)
+                    # Ensure URL is properly formatted
+                    if not url.startswith("http"):
+                        url = f"https://{url}"
+                    
+                    # Extract handle from URL or use provided handle
+                    handle_match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url, re.I)
+                    h = handle_match.group(1) if handle_match else (handle.strip().lstrip("@") if handle else None)
+                    
+                    if h:
+                        return (h.lower(), url)
     
-    for key in ("twitterUrl", "twitter", "x"):
+    # Try direct keys
+    for key in ("twitterUrl", "twitter", "x", "twitterHandle"):
         v = info.get(key)
         if isinstance(v, str) and v.strip():
-            if "http" in v.lower():
-                handle_match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', v)
-                handle = handle_match.group(1) if handle_match else None
-                return (handle.lower() if handle else None, v)
+            v = v.strip()
+            
+            if "http" in v.lower() or "twitter.com" in v.lower() or "x.com" in v.lower():
+                if not v.startswith("http"):
+                    v = f"https://{v}"
+                handle_match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', v, re.I)
+                h = handle_match.group(1) if handle_match else None
+                if h:
+                    return (h.lower(), v)
             else:
-                h = v.strip().lstrip("@").lower()
-                return (h, f"https://x.com/{h}")
+                # It's just a handle
+                h = v.lstrip("@").lower()
+                if h and len(h) <= 15:
+                    return (h, f"https://x.com/{h}")
     
     return (None, None)
 
@@ -821,25 +853,50 @@ async def cmd_scrape(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     
     url = args[1]
-    await u.message.reply_text(f"Scraping {url}...")
+    await u.message.reply_text(f"🔍 Scraping {url}...")
     
-    usernames = twitter_scraper.scrape_url(url)
-    followed_by = [h for h in usernames if h in MY_HANDLES]
-    extras = [h for h in usernames if h not in MY_HANDLES]
+    try:
+        usernames = twitter_scraper.scrape_url(url)
+        followed_by = [h for h in usernames if h in MY_HANDLES]
+        extras = [h for h in usernames if h not in MY_HANDLES]
+        
+        response = f"✅ Found {len(usernames)} usernames\n"
+        response += f"📊 My handles loaded: {len(MY_HANDLES)}\n\n"
+        
+        if followed_by:
+            response += f"👥 Followed by ({len(followed_by)}):\n"
+            response += ", ".join(f"@{h}" for h in followed_by[:30])
+            if len(followed_by) > 30:
+                response += f"\n... +{len(followed_by) - 30} more"
+            response += "\n\n"
+        else:
+            response += "👥 Followed by: None\n\n"
+        
+        if extras:
+            response += f"➕ Extras ({len(extras)}):\n"
+            response += ", ".join(f"@{h}" for h in extras[:30])
+            if len(extras) > 30:
+                response += f"\n... +{len(extras) - 30} more"
+        else:
+            response += "➕ Extras: None"
+        
+        await u.message.reply_text(response)
+    except Exception as e:
+        await u.message.reply_text(f"❌ Error: {str(e)}")
+
+async def cmd_handles(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Show handles file info"""
+    response = f"📊 Handles file: {MY_FOLLOWING_TXT}\n"
+    response += f"📈 Total handles loaded: {len(MY_HANDLES)}\n\n"
     
-    response = f"Found {len(usernames)} usernames:\n\n"
-    if followed_by:
-        response += f"Followed by ({len(followed_by)}):\n"
-        response += ", ".join(f"@{h}" for h in followed_by[:30])
-        if len(followed_by) > 30:
-            response += f"\n... +{len(followed_by) - 30} more"
-        response += "\n\n"
-    
-    if extras:
-        response += f"Extras ({len(extras)}):\n"
-        response += ", ".join(f"@{h}" for h in extras[:30])
-        if len(extras) > 30:
-            response += f"\n... +{len(extras) - 30} more"
+    if MY_HANDLES:
+        sample = sorted(MY_HANDLES)[:20]
+        response += f"Sample (first 20):\n"
+        response += ", ".join(f"@{h}" for h in sample)
+        if len(MY_HANDLES) > 20:
+            response += f"\n... +{len(MY_HANDLES) - 20} more"
+    else:
+        response += "⚠️ No handles loaded! Check file path."
     
     await u.message.reply_text(response)
 
@@ -869,6 +926,7 @@ application.add_handler(CommandHandler("status", cmd_status))
 application.add_handler(CommandHandler("trade", cmd_trade))
 application.add_handler(CommandHandler("mirror", cmd_mirror))
 application.add_handler(CommandHandler("scrape", cmd_scrape))
+application.add_handler(CommandHandler("handles", cmd_handles))
 
 # -----------------------------------------------------------------------------
 # FastAPI + Webhook
