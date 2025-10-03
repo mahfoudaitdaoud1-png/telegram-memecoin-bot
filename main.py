@@ -77,9 +77,13 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "tg-memebot", "Accept": "*/*"})
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 
+# ScrapingBee API key
+SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY", "").strip()
+
 READER_SERVICES = [
-    {"name": "Jina", "url": "https://r.jina.ai/", "prefix": True},
-    {"name": "Txtify", "url": "https://txtify.it/", "prefix": True},
+    {"name": "ScrapingBee", "url": "https://app.scrapingbee.com/api/v1/", "prefix": False, "is_scrapingbee": True},
+    {"name": "Jina", "url": "https://r.jina.ai/", "prefix": True, "is_scrapingbee": False},
+    {"name": "Txtify", "url": "https://txtify.it/", "prefix": True, "is_scrapingbee": False},
 ]
 
 # -----------------------------------------------------------------------------
