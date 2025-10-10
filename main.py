@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Solana Memecoin Bot with Token Profiles API + Twitter Scraper
-Optimized and debugged version matching BSC implementation
+Solana Memecoin Bot - Exact BSC Implementation
+Using BSC's working API implementation
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ MIN_VOL_H24_USD = float(os.getenv("MIN_VOL_H24_USD", "40000"))
 MAX_AGE_MIN = float(os.getenv("MAX_AGE_MIN", "120"))
 CHAIN_ID = os.getenv("CHAIN_ID", "solana").lower()
 
+# Solana-specific URLs
 AXIOM_WEB_URL = os.getenv("AXIOM_WEB_URL", "https://axiom.trade/meme/{pair}")
 GMGN_WEB_URL = os.getenv("GMGN_WEB_URL", "https://gmgn.ai/sol/token/{mint}")
 DEXSCREENER_PAIR_URL = os.getenv("DEXSCREENER_PAIR_URL", "https://dexscreener.com/solana/{pair}")
@@ -356,7 +357,7 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                     return (h, f"https://x.com/{h}")
     return (None, None)
 
-# Dexscreener endpoints
+# Dexscreener endpoints - EXACT SAME AS BSC
 TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chainId}/{address}"
 PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 
@@ -396,50 +397,32 @@ def _row_age_min(row: dict) -> float:
 
 def _discover_from_profiles(chain=CHAIN_ID, max_age_min=MAX_AGE_MIN * 2) -> List[dict]:
     """
-    Fetch latest token profiles from Dexscreener, filter by chain, enrich each token.
-    This matches the BSC implementation exactly.
+    EXACT COPY OF BSC IMPLEMENTATION - just with solana/sol variants
     """
     j = _get_json(PROFILES_URL, timeout=15) or {}
-    
-    # Handle both list and dict responses  
     items = j if isinstance(j, list) else (j.get("items") or j.get("profiles") or [])
-    
-    log.info(f"[Profiles] Raw API returned {len(items)} total profiles across all chains")
-    
     out: List[dict] = []
-    chain_variants = [chain, "sol" if chain == "solana" else chain]  # Handle both solana/sol
+    
+    # Support both "solana" and "sol" chain IDs
+    chain_check = chain if chain != "solana" else ["solana", "sol"]
+    if isinstance(chain_check, str):
+        chain_check = [chain_check]
     
     for it in items:
-        # Filter by chain - case insensitive, handle both "solana" and "sol"
         token_chain = (it.get("chainId") or "").lower()
-        if token_chain not in chain_variants:
+        if token_chain not in chain_check:
             continue
-        
-        # Get token address
         mint = it.get("tokenAddress")
         if not mint:
-            log.debug(f"[Profiles] Skipping profile - no tokenAddress")
             continue
-        
-        # Enrich with full pair data
-        log.debug(f"[Profiles] Enriching token {mint[:10]}... for chain {token_chain}")
         enriched = _best_pool_for_mint(chain, mint)
         if not enriched:
-            log.debug(f"[Profiles] No pool found for {mint[:10]}...")
             continue
-        
-        # Check age
         age_m = _row_age_min(enriched)
         if age_m <= max_age_min:
             out.append(enriched)
-            log.debug(f"[Profiles] Added {mint[:10]}... age={age_m:.0f}m")
-        else:
-            log.debug(f"[Profiles] Skipped {mint[:10]}... too old: {age_m:.0f}m > {max_age_min}m")
-    
-    # Sort by creation time (newest first)
     out.sort(key=lambda x: x.get("pairCreatedAt") or 0, reverse=True)
-    
-    log.info(f"[Profiles] ✅ Filtered to {len(out)} {chain.upper()} tokens within {max_age_min}min age")
+    log.info(f"[Profiles] {chain.upper()} profiles fetched={len(out)}")
     return out
 
 def _mirror_load() -> dict:
@@ -484,43 +467,28 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
     return (mint, pair, created)
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Main ingestion job - matches BSC implementation exactly
-    """
     try:
-        log.info(f"[Ingester] 🔄 Starting discovery via token-profiles for chain={CHAIN_ID.upper()}")
+        log.info(f"[Ingester] Starting discovery via token-profiles feed for chain={CHAIN_ID}")
         rows = _discover_from_profiles(CHAIN_ID)
-        log.info(f"[Ingester] Found {len(rows)} enriched {CHAIN_ID.upper()} tokens")
-        
-        if not rows:
-            log.warning(f"[Ingester] ⚠️ No tokens found for {CHAIN_ID.upper()} - check API or filters")
-            return
-        
+        log.info(f"[Ingester] {len(rows)} enriched {CHAIN_ID.upper()} tokens found")
         for r in rows:
             mint, pair, created = _normalize_row_to_token(r)
             if not mint:
                 continue
-            
             mirror_upsert_token(mint, pair, created, r)
-            
-            # Log token details
             try:
                 liq = float((r.get("liquidity") or {}).get("usd", 0) or 0)
                 vol = float((r.get("volume") or {}).get("h24", 0) or 0)
                 mcap = float((r.get("fdv") if r.get("fdv") is not None else (r.get("marketCap") or 0)) or 0)
                 age_m = _row_age_min(r)
-                log.info(f"[Ingester] ✅ {mint[:10]}.. liq=${liq:,.0f} vol=${vol:,.0f} mcap=${mcap:,.0f} age={age_m:.0f}m")
+                log.info(f"[Ingester] upsert {mint[:10]}.. liq=${liq:,.0f} vol=${vol:,.0f} mcap=${mcap:,.0f} age={age_m:.0f}m")
             except Exception:
                 pass
-            
             await asyncio.sleep(0.05)
-        
         _mirror_save(MIRROR)
-        stats = mirror_stats()
-        log.info(f"[Ingester] 💾 Mirror saved: {stats['tokens']} tokens, {stats['pairs']} pairs")
-        
+        log.info(f"[Ingester] Mirror now has {len(MIRROR['tokens'])} tokens")
     except Exception as e:
-        log.exception(f"[Ingester] ❌ Error: {e}")
+        log.exception(f"[Ingester] Error: {e}")
 
 def _pairs_from_mirror() -> List[dict]:
     rows = []
@@ -609,7 +577,7 @@ def link_keyboard(m: dict) -> InlineKeyboardMarkup:
 
 def _pct_str(first: float, cur: float) -> str:
     if first > 0 and cur >= 0:
-        d = (cur - first) / first * 100.0
+        d = (cur - first) / first * 100.0:
         return f"{'+' if d >= 0 else ''}{d:.1f}%"
     return "n/a"
 
@@ -620,6 +588,8 @@ def build_caption(m: dict, followed_by: List[str], extras: List[str], is_update:
     pct = _pct_str(first, cur)
     circle = "🟢" if (first > 0 and cur >= first) else "🔴"
     price = float(m.get("price_usd") or 0)
+    token = m.get("token") or ""
+    token_display = f"{token[:10]}...{token[-8:]}" if len(token) > 42 else token
     header = f"{fire_or_ice} <b>{html_escape(m['name'])}</b>"
     price_line = f"💵 <b>Price:</b> " + (f"${price:.8f}" if price < 1 else f"${price:,.4f}")
     
@@ -645,7 +615,7 @@ def build_caption(m: dict, followed_by: List[str], extras: List[str], is_update:
         f"{header}\n"
         f"🏦 <b>First Mcap:</b> 🔵 ${first:,.0f}\n"
         f"🏦 <b>Current Mcap:</b> {circle} ${cur:,.0f} <b>({pct})</b>\n"
-        f"🖨️ <b>Mint:</b> <code>{html_escape(m['token'][:20])}...</code>\n"
+        f"🖨️ <b>Mint:</b> <code>{html_escape(token_display)}</code>\n"
         f"💧 <b>Liquidity:</b> ${m['liquidity_usd']:,.0f}\n"
         f"{price_line}\n"
         f"📈 <b>Vol 24h:</b> ${m['vol24_usd']:,.0f}\n"
@@ -686,17 +656,12 @@ async def send_new_token(bot, chat_id: int, m: dict):
     kb = link_keyboard(m)
     msg_id = await _send_or_photo(bot, chat_id, caption, kb, token=m.get("token"), logo_hint=m.get("logo_hint"))
     
-    # Pin fire emoji messages
-    if msg_id and m.get("is_first_time"):
+    if msg_id:
         try:
-            await bot.pin_chat_message(
-                chat_id=chat_id,
-                message_id=msg_id,
-                disable_notification=True
-            )
-            log.info(f"📌 Pinned 🔥 token {m.get('name')} in chat {chat_id}")
+            await bot.pin_chat_message(chat_id=chat_id, message_id=msg_id, disable_notification=True)
+            log.info(f"📌 Pinned fire emoji token {m.get('name')} in chat {chat_id}")
         except Exception as e:
-            log.warning(f"⚠️ Pin failed in {chat_id}: {e}")
+            log.warning(f"⚠️ Failed to pin message in {chat_id}: {e}")
 
 async def send_price_update(bot, chat_id: int, m: dict):
     followed_by, extras = analyze_twitter_overlap(m.get("tw_url"), is_first_time=False)
@@ -779,7 +744,7 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global SUBS
     SUBS.add(u.effective_chat.id)
     _save_subs_to_file()
-    await u.message.reply_text(f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s + 🧊 updates every {UPDATE_INTERVAL_SEC}s\nUsing Token Profiles API + Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
+    await u.message.reply_text(f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s + 🧊 updates every {UPDATE_INTERVAL_SEC}s\nToken Profiles API + Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(str(u.effective_chat.id))
@@ -916,29 +881,28 @@ async def healthz():
 @app.on_event("startup")
 async def _startup():
     global SUBS, FIRST_SEEN, MIRROR, MY_HANDLES
-    log.info("🔄 FastAPI startup - loading data...")
+    if pathlib.Path(MIRROR_JSON).exists():
+        MIRROR.update(_mirror_load())
+    FIRST_SEEN.update(_load_first_seen())
     SUBS = _load_subs_from_file()
-    FIRST_SEEN = _load_first_seen()
-    MIRROR = _mirror_load()
     MY_HANDLES = load_my_following()
-    
-    log.info("🤖 Initializing Telegram bot...")
-    await application.initialize()
-    log.info("✅ Bot initialized")
-    
-    await application.start()
-    log.info("✅ Bot started")
-    
-    jq = application.job_queue
-    if jq:
-        jq.run_repeating(ingester, interval=timedelta(seconds=INGEST_INTERVAL_SEC), first=timedelta(seconds=2), name="ingester")
-        jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
-        jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
-        log.info("✅ Job queue started")
-    else:
-        log.error("⚠️ Job queue is None!")
-    
-    log.info("✅✅✅ STARTUP COMPLETE - Bot ready")
+    asyncio.create_task(_start_bot_and_jobs())
+
+async def _start_bot_and_jobs():
+    try:
+        await application.initialize()
+        await application.start()
+        jq = application.job_queue
+        if jq:
+            jq.run_repeating(ingester, interval=timedelta(seconds=INGEST_INTERVAL_SEC), first=timedelta(seconds=2), name="ingester")
+            jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
+            jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
+            log.info("🚀 SOL Bot initialized & started with job queue")
+        else:
+            log.error("⚠️ Job queue is None - background tasks will NOT run!")
+            log.info("🚀 SOL Bot initialized & started WITHOUT job queue")
+    except Exception as e:
+        log.exception("Bot startup failed: %r", e)
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -949,32 +913,17 @@ async def _shutdown():
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
-    log.info(f"📥 Webhook hit! Token match: {token == TG}")
-    
     if token != TG:
-        log.warning(f"⚠️ Token mismatch!")
         return Response(status_code=403)
-    
     try:
         data: Dict[str, Any] = await request.json()
-        log.info(f"📨 Received update: update_id={data.get('update_id')}")
-    except Exception as e:
-        log.error(f"❌ JSON parse error: {e}")
+    except:
         return Response(status_code=400)
-    
     try:
         update = Update.de_json(data, application.bot)
-        log.info(f"✅ Update object created, ID: {update.update_id}")
-        
-        if update.message:
-            log.info(f"📝 Message from {update.message.from_user.id}: {update.message.text}")
-        
         await application.process_update(update)
-        log.info(f"✅ Update processed successfully")
-        
     except Exception as e:
-        log.exception(f"❌ Processing error: {e}")
-    
+        log.exception("process_update error: %r", e)
     return Response(status_code=200)
 
 if __name__ == "__main__":
