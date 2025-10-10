@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Integrated Memecoin Bot with Enhanced Twitter Community/Profile Scraper
-Uses reader services (Jina, Txtify, ScrapingBee) to bypass Google Cloud IP blocks
+Integrated Memecoin Bot with Token Profiles API + Enhanced Twitter Scraper
 """
 
 from __future__ import annotations
@@ -30,12 +29,11 @@ ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID", "0"))
 TRADE_SUMMARY_SEC = int(os.getenv("TRADE_SUMMARY_SEC", "5"))
 UPDATE_INTERVAL_SEC = int(os.getenv("UPDATE_INTERVAL_SEC", "90"))
 UPDATE_MAX_DURATION_MIN = int(os.getenv("UPDATE_MAX_DURATION_MIN", "60"))
-INGEST_INTERVAL_SEC = int(os.getenv("INGEST_INTERVAL_SEC", "12"))
+INGEST_INTERVAL_SEC = int(os.getenv("INGEST_INTERVAL_SEC", "5"))
 
 TWITTER_SCRAPER_ENABLED = os.getenv("TWITTER_SCRAPER_ENABLED", "1") == "1"
 TWITTER_SCRAPE_TIMEOUT = int(os.getenv("TWITTER_SCRAPE_TIMEOUT", "60"))
 TWITTER_MAX_USERNAMES = int(os.getenv("TWITTER_MAX_USERNAMES", "200"))
-SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY", "").strip()
 
 MIN_LIQ_USD = float(os.getenv("MIN_LIQ_USD", "35000"))
 MIN_MCAP_USD = float(os.getenv("MIN_MCAP_USD", "70000"))
@@ -73,10 +71,9 @@ HEADERS = {
 }
 
 READER_SERVICES = [
-    {"name": "ScrapingBee", "url": "https://app.scrapingbee.com/api/v1/", "prefix": False, "is_scrapingbee": True},
-    {"name": "Jina", "url": "https://r.jina.ai/", "prefix": True, "is_scrapingbee": False},
-    {"name": "Txtify", "url": "https://txtify.it/", "prefix": True, "is_scrapingbee": False},
-    {"name": "12ft", "url": "https://12ft.io/", "prefix": True, "is_scrapingbee": False},
+    {"name": "Jina", "url": "https://r.jina.ai/", "prefix": True},
+    {"name": "Txtify", "url": "https://txtify.it/", "prefix": True},
+    {"name": "12ft", "url": "https://12ft.io/", "prefix": True},
 ]
 
 class TwitterPatternMatcher:
@@ -171,16 +168,12 @@ class TwitterScraper:
     
     def _try_service(self, url: str, service: Dict) -> Optional[str]:
         try:
-            if service.get("is_scrapingbee") and SCRAPINGBEE_API_KEY:
-                params = {'api_key': SCRAPINGBEE_API_KEY, 'url': url, 'render_js': 'false', 'premium_proxy': 'false'}
-                response = SESSION.get(service['url'], params=params, timeout=TWITTER_SCRAPE_TIMEOUT)
+            if service['prefix']:
+                clean_url = url.replace('https://', '').replace('http://', '')
+                fetch_url = service['url'] + clean_url
             else:
-                if service['prefix']:
-                    clean_url = url.replace('https://', '').replace('http://', '')
-                    fetch_url = service['url'] + clean_url
-                else:
-                    fetch_url = url
-                response = SESSION.get(fetch_url, headers=HEADERS, timeout=TWITTER_SCRAPE_TIMEOUT)
+                fetch_url = url
+            response = SESSION.get(fetch_url, headers=HEADERS, timeout=TWITTER_SCRAPE_TIMEOUT)
             
             if response.status_code == 200 and len(response.text) > 500:
                 log.info(f"[Twitter] {service['name']} OK: {len(response.text):,} chars")
@@ -362,8 +355,9 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                     return (h, f"https://x.com/{h}")
     return (None, None)
 
-SEARCH_NEW_URL = "https://api.dexscreener.com/latest/dex/search?q=chain:{chain}%20new"
+# Dexscreener endpoints
 TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chainId}/{address}"
+PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 
 def _get_json(url, timeout=HTTP_TIMEOUT, tries=2):
     for i in range(tries):
@@ -376,11 +370,8 @@ def _get_json(url, timeout=HTTP_TIMEOUT, tries=2):
         time.sleep(0.2 * (i + 1))
     return None
 
-def _discover_search_new(chain=CHAIN_ID) -> List[dict]:
-    j = _get_json(SEARCH_NEW_URL.format(chain=chain), timeout=15) or {}
-    return j.get("pairs", []) if isinstance(j, dict) else []
-
 def _best_pool_for_mint(chain, mint) -> Optional[dict]:
+    """Get the best pool (highest liquidity + newest) for a token mint"""
     arr = _get_json(TOKEN_PAIRS_URL.format(chainId=chain, address=mint), timeout=15) or []
     if not isinstance(arr, list) or not arr:
         return None
@@ -393,6 +384,56 @@ def _best_pool_for_mint(chain, mint) -> Optional[dict]:
         if best is None or k > key:
             best, key = p, k
     return best
+
+def _row_age_min(row: dict) -> float:
+    """Calculate age of a pair in minutes"""
+    try:
+        created = float(row.get("pairCreatedAt") or 0)
+        if not created:
+            return float("inf")
+        return max(0.0, (time.time() * 1000.0 - created) / 60000.0)
+    except:
+        return float("inf")
+
+def _discover_from_profiles(chain=CHAIN_ID, max_age_min=MAX_AGE_MIN * 2) -> List[dict]:
+    """
+    Fetch latest token profiles from Dexscreener, filter by chain, enrich each token
+    with full pair data, and return only recent ones
+    """
+    j = _get_json(PROFILES_URL, timeout=15) or {}
+    
+    # Handle both list and dict responses
+    items = j if isinstance(j, list) else (j.get("items") or j.get("profiles") or [])
+    
+    log.info(f"[Profiles] Raw response contains {len(items)} total profiles")
+    
+    out: List[dict] = []
+    for it in items:
+        # Filter by chain
+        token_chain = (it.get("chainId") or "").lower()
+        if token_chain != chain:
+            continue
+        
+        # Get token address
+        mint = it.get("tokenAddress")
+        if not mint:
+            continue
+        
+        # Enrich with full pair data
+        enriched = _best_pool_for_mint(chain, mint)
+        if not enriched:
+            continue
+        
+        # Check age
+        age_m = _row_age_min(enriched)
+        if age_m <= max_age_min:
+            out.append(enriched)
+    
+    # Sort by creation time (newest first)
+    out.sort(key=lambda x: x.get("pairCreatedAt") or 0, reverse=True)
+    
+    log.info(f"[Profiles] Filtered to {len(out)} {chain.upper()} tokens within {max_age_min}min")
+    return out
 
 def _mirror_load() -> dict:
     p = pathlib.Path(MIRROR_JSON)
@@ -424,7 +465,9 @@ def mirror_upsert_token(mint: str, pair: Optional[str], created_at: Optional[int
     MIRROR["tokens"][mint] = t
 
 def mirror_stats() -> dict:
-    return {"tokens": len(MIRROR.get("tokens", {})), "pairs": len(MIRROR.get("pairs", {}))}
+    toks = MIRROR.get("tokens", {})
+    n_pairs = sum(1 for v in toks.values() if (v.get("last") or {}).get("pairAddress"))
+    return {"tokens": len(toks), "pairs": n_pairs}
 
 def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int]]:
     base = row.get("baseToken") or {}
@@ -434,14 +477,38 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
     return (mint, pair, created)
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Main ingestion job: fetch token profiles, enrich, and store in mirror
+    """
     try:
-        for r in _discover_search_new(CHAIN_ID):
+        log.info(f"[Ingester] Starting discovery via token-profiles feed for chain={CHAIN_ID}")
+        rows = _discover_from_profiles(CHAIN_ID)
+        log.info(f"[Ingester] {len(rows)} enriched {CHAIN_ID.upper()} tokens found")
+        
+        for r in rows:
             mint, pair, created = _normalize_row_to_token(r)
-            if mint:
-                mirror_upsert_token(mint, pair, created, r)
+            if not mint:
+                continue
+            
+            mirror_upsert_token(mint, pair, created, r)
+            
+            # Log token details
+            try:
+                liq = float((r.get("liquidity") or {}).get("usd", 0) or 0)
+                vol = float((r.get("volume") or {}).get("h24", 0) or 0)
+                mcap = float((r.get("fdv") if r.get("fdv") is not None else (r.get("marketCap") or 0)) or 0)
+                age_m = _row_age_min(r)
+                log.info(f"[Ingester] upsert {mint[:10]}.. liq=${liq:,.0f} vol=${vol:,.0f} mcap=${mcap:,.0f} age={age_m:.0f}m")
+            except Exception:
+                pass
+            
+            await asyncio.sleep(0.05)
+        
         _mirror_save(MIRROR)
-    except:
-        pass
+        log.info(f"[Ingester] Mirror now has {len(MIRROR['tokens'])} tokens")
+        
+    except Exception as e:
+        log.exception(f"[Ingester] Error: {e}")
 
 def _pairs_from_mirror() -> List[dict]:
     rows = []
@@ -561,8 +628,8 @@ def build_caption(m: dict, followed_by: List[str], extras: List[str], is_update:
         extras_line = f"➕ <b>Extras:</b> {extras_text}\n"
     return (
         f"{header}\n"
-        f"🏦 <b>First Mcap:</b> 🔵 ${first:,.0f}\n"
-        f"🏦 <b>Current Mcap:</b> {circle} ${cur:,.0f} <b>({pct})</b>\n"
+        f"🦄 <b>First Mcap:</b> 🔵 ${first:,.0f}\n"
+        f"🦄 <b>Current Mcap:</b> {circle} ${cur:,.0f} <b>({pct})</b>\n"
         f"🖨️ <b>Mint:</b> <code>{html_escape(m['token'][:20])}...</code>\n"
         f"💧 <b>Liquidity:</b> ${m['liquidity_usd']:,.0f}\n"
         f"{price_line}\n"
@@ -602,7 +669,19 @@ async def send_new_token(bot, chat_id: int, m: dict):
     followed_by, extras = analyze_twitter_overlap(m.get("tw_url"), is_first_time=True)
     caption = build_caption(m, followed_by, extras, is_update=False)
     kb = link_keyboard(m)
-    await _send_or_photo(bot, chat_id, caption, kb, token=m.get("token"), logo_hint=m.get("logo_hint"))
+    msg_id = await _send_or_photo(bot, chat_id, caption, kb, token=m.get("token"), logo_hint=m.get("logo_hint"))
+    
+    # Pin fire emoji messages
+    if msg_id and m.get("is_first_time"):
+        try:
+            await bot.pin_chat_message(
+                chat_id=chat_id,
+                message_id=msg_id,
+                disable_notification=True
+            )
+            log.info(f"📌 Pinned 🔥 token {m.get('name')} in chat {chat_id}")
+        except Exception as e:
+            log.warning(f"⚠️ Pin failed in {chat_id}: {e}")
 
 async def send_price_update(bot, chat_id: int, m: dict):
     followed_by, extras = analyze_twitter_overlap(m.get("tw_url"), is_first_time=False)
@@ -685,7 +764,7 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global SUBS
     SUBS.add(u.effective_chat.id)
     _save_subs_to_file()
-    await u.message.reply_text(f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s + 🧊 updates every {UPDATE_INTERVAL_SEC}s\nTwitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
+    await u.message.reply_text(f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s + 🧊 updates every {UPDATE_INTERVAL_SEC}s\nUsing Token Profiles API + Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(str(u.effective_chat.id))
@@ -704,7 +783,7 @@ async def cmd_unsub(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     s = mirror_stats()
-    await u.message.reply_text(f"Subscribers: {len(SUBS)} | 🔥 /trade every {TRADE_SUMMARY_SEC}s | 🧊 updates every {UPDATE_INTERVAL_SEC}s\nMirror -> tokens: {s['tokens']} | My following: {len(MY_HANDLES)}\nTwitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\nScrapingBee: {'Configured' if SCRAPINGBEE_API_KEY else 'Not configured'}")
+    await u.message.reply_text(f"Subscribers: {len(SUBS)} | 🔥 /trade every {TRADE_SUMMARY_SEC}s | 🧊 updates every {UPDATE_INTERVAL_SEC}s\nMirror -> tokens: {s['tokens']} pairs: {s['pairs']} | Following: {len(MY_HANDLES)}\nToken Profiles API enabled\nTwitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = (u.message.text or "").split()
@@ -790,10 +869,11 @@ async def _post_init(app: Application):
         SUBS.add(ALERT_CHAT_ID)
         _save_subs_to_file()
     await _validate_subs(app.bot)
+    log.info(f"📊 Chain: {CHAIN_ID.upper()}")
     log.info(f"Subscribers: {sorted(SUBS)}")
     log.info(f"Following: {len(MY_HANDLES)} handles")
+    log.info(f"Token Profiles API: Enabled")
     log.info(f"Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
-    log.info(f"ScrapingBee: {'Configured' if SCRAPINGBEE_API_KEY else 'Not configured'}")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
 application.add_handler(CommandHandler("start", cmd_start))
@@ -812,7 +892,7 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/")
 async def health_root():
-    return {"ok": True, "twitter_scraper": TWITTER_SCRAPER_ENABLED}
+    return {"ok": True, "chain": CHAIN_ID, "api": "token-profiles", "twitter_scraper": TWITTER_SCRAPER_ENABLED}
 
 @app.get("/healthz")
 async def healthz():
@@ -821,23 +901,31 @@ async def healthz():
 @app.on_event("startup")
 async def _startup():
     global SUBS, FIRST_SEEN, MIRROR, MY_HANDLES
+    log.info("🔄 FastAPI startup - loading data...")
     SUBS = _load_subs_from_file()
     FIRST_SEEN = _load_first_seen()
     MIRROR = _mirror_load()
     MY_HANDLES = load_my_following()
-    asyncio.create_task(_start_bot_and_jobs())
-
-async def _start_bot_and_jobs():
-    try:
-        await application.initialize()
-        jq = application.job_queue
+    
+    # Initialize bot synchronously
+    log.info("🤖 Initializing Telegram bot...")
+    await application.initialize()
+    log.info("✅ Bot initialized")
+    
+    await application.start()
+    log.info("✅ Bot started")
+    
+    # Start background jobs
+    jq = application.job_queue
+    if jq:
         jq.run_repeating(ingester, interval=timedelta(seconds=INGEST_INTERVAL_SEC), first=timedelta(seconds=2), name="ingester")
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
         jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
-        await application.start()
-        log.info("Bot initialized & started")
-    except Exception as e:
-        log.exception("Bot startup failed: %r", e)
+        log.info("✅ Job queue started")
+    else:
+        log.error("⚠️ Job queue is None!")
+    
+    log.info("✅✅✅ STARTUP COMPLETE - Bot ready to receive updates")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -848,17 +936,32 @@ async def _shutdown():
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
+    log.info(f"📥 Webhook hit! Token match: {token == TG}")
+    
     if token != TG:
+        log.warning(f"⚠️ Token mismatch!")
         return Response(status_code=403)
+    
     try:
         data: Dict[str, Any] = await request.json()
-    except:
+        log.info(f"📨 Received update: update_id={data.get('update_id')}")
+    except Exception as e:
+        log.error(f"❌ JSON parse error: {e}")
         return Response(status_code=400)
+    
     try:
         update = Update.de_json(data, application.bot)
+        log.info(f"✅ Update object created, ID: {update.update_id}")
+        
+        if update.message:
+            log.info(f"📝 Message from {update.message.from_user.id}: {update.message.text}")
+        
         await application.process_update(update)
+        log.info(f"✅ Update processed successfully")
+        
     except Exception as e:
-        log.exception("process_update error: %r", e)
+        log.exception(f"❌ Processing error: {e}")
+    
     return Response(status_code=200)
 
 if __name__ == "__main__":
