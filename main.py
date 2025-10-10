@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Integrated Memecoin Bot with Token Profiles API + Enhanced Twitter Scraper
+Solana Memecoin Bot with Token Profiles API + Twitter Scraper
+Optimized and debugged version matching BSC implementation
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ for d in [pathlib.Path(SUBS_FILE).parent, pathlib.Path(FIRST_SEEN_FILE).parent]:
     d.mkdir(parents=True, exist_ok=True)
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "tg-memebot", "Accept": "*/*"})
+SESSION.headers.update({"User-Agent": "tg-memebot-sol", "Accept": "*/*"})
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
 
 HEADERS = {
@@ -334,8 +335,8 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                 if url and ("twitter" in url.lower() or "x.com" in url.lower() or "twitter" in plat or "x" == plat):
                     if not url.startswith("http"):
                         url = f"https://{url}"
-                    handle_match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url, re.I)
-                    h = handle_match.group(1) if handle_match else (handle.strip().lstrip("@") if handle else None)
+                    m = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url, re.I)
+                    h = m.group(1) if m else (handle.strip().lstrip("@") if handle else None)
                     if h:
                         return (h.lower(), url)
     for key in ("twitterUrl", "twitter", "x", "twitterHandle"):
@@ -345,8 +346,8 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
             if "http" in v.lower() or "twitter.com" in v.lower() or "x.com" in v.lower():
                 if not v.startswith("http"):
                     v = f"https://{v}"
-                handle_match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', v, re.I)
-                h = handle_match.group(1) if handle_match else None
+                m = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', v, re.I)
+                h = m.group(1) if m else None
                 if h:
                     return (h.lower(), v)
             else:
@@ -371,7 +372,6 @@ def _get_json(url, timeout=HTTP_TIMEOUT, tries=2):
     return None
 
 def _best_pool_for_mint(chain, mint) -> Optional[dict]:
-    """Get the best pool (highest liquidity + newest) for a token mint"""
     arr = _get_json(TOKEN_PAIRS_URL.format(chainId=chain, address=mint), timeout=15) or []
     if not isinstance(arr, list) or not arr:
         return None
@@ -386,7 +386,6 @@ def _best_pool_for_mint(chain, mint) -> Optional[dict]:
     return best
 
 def _row_age_min(row: dict) -> float:
-    """Calculate age of a pair in minutes"""
     try:
         created = float(row.get("pairCreatedAt") or 0)
         if not created:
@@ -397,42 +396,50 @@ def _row_age_min(row: dict) -> float:
 
 def _discover_from_profiles(chain=CHAIN_ID, max_age_min=MAX_AGE_MIN * 2) -> List[dict]:
     """
-    Fetch latest token profiles from Dexscreener, filter by chain, enrich each token
-    with full pair data, and return only recent ones
+    Fetch latest token profiles from Dexscreener, filter by chain, enrich each token.
+    This matches the BSC implementation exactly.
     """
     j = _get_json(PROFILES_URL, timeout=15) or {}
     
-    # Handle both list and dict responses
+    # Handle both list and dict responses  
     items = j if isinstance(j, list) else (j.get("items") or j.get("profiles") or [])
     
-    log.info(f"[Profiles] Raw response contains {len(items)} total profiles")
+    log.info(f"[Profiles] Raw API returned {len(items)} total profiles across all chains")
     
     out: List[dict] = []
+    chain_variants = [chain, "sol" if chain == "solana" else chain]  # Handle both solana/sol
+    
     for it in items:
-        # Filter by chain
+        # Filter by chain - case insensitive, handle both "solana" and "sol"
         token_chain = (it.get("chainId") or "").lower()
-        if token_chain != chain:
+        if token_chain not in chain_variants:
             continue
         
         # Get token address
         mint = it.get("tokenAddress")
         if not mint:
+            log.debug(f"[Profiles] Skipping profile - no tokenAddress")
             continue
         
         # Enrich with full pair data
+        log.debug(f"[Profiles] Enriching token {mint[:10]}... for chain {token_chain}")
         enriched = _best_pool_for_mint(chain, mint)
         if not enriched:
+            log.debug(f"[Profiles] No pool found for {mint[:10]}...")
             continue
         
         # Check age
         age_m = _row_age_min(enriched)
         if age_m <= max_age_min:
             out.append(enriched)
+            log.debug(f"[Profiles] Added {mint[:10]}... age={age_m:.0f}m")
+        else:
+            log.debug(f"[Profiles] Skipped {mint[:10]}... too old: {age_m:.0f}m > {max_age_min}m")
     
     # Sort by creation time (newest first)
     out.sort(key=lambda x: x.get("pairCreatedAt") or 0, reverse=True)
     
-    log.info(f"[Profiles] Filtered to {len(out)} {chain.upper()} tokens within {max_age_min}min")
+    log.info(f"[Profiles] ✅ Filtered to {len(out)} {chain.upper()} tokens within {max_age_min}min age")
     return out
 
 def _mirror_load() -> dict:
@@ -478,12 +485,16 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     """
-    Main ingestion job: fetch token profiles, enrich, and store in mirror
+    Main ingestion job - matches BSC implementation exactly
     """
     try:
-        log.info(f"[Ingester] Starting discovery via token-profiles feed for chain={CHAIN_ID}")
+        log.info(f"[Ingester] 🔄 Starting discovery via token-profiles for chain={CHAIN_ID.upper()}")
         rows = _discover_from_profiles(CHAIN_ID)
-        log.info(f"[Ingester] {len(rows)} enriched {CHAIN_ID.upper()} tokens found")
+        log.info(f"[Ingester] Found {len(rows)} enriched {CHAIN_ID.upper()} tokens")
+        
+        if not rows:
+            log.warning(f"[Ingester] ⚠️ No tokens found for {CHAIN_ID.upper()} - check API or filters")
+            return
         
         for r in rows:
             mint, pair, created = _normalize_row_to_token(r)
@@ -498,17 +509,18 @@ async def ingester(context: ContextTypes.DEFAULT_TYPE):
                 vol = float((r.get("volume") or {}).get("h24", 0) or 0)
                 mcap = float((r.get("fdv") if r.get("fdv") is not None else (r.get("marketCap") or 0)) or 0)
                 age_m = _row_age_min(r)
-                log.info(f"[Ingester] upsert {mint[:10]}.. liq=${liq:,.0f} vol=${vol:,.0f} mcap=${mcap:,.0f} age={age_m:.0f}m")
+                log.info(f"[Ingester] ✅ {mint[:10]}.. liq=${liq:,.0f} vol=${vol:,.0f} mcap=${mcap:,.0f} age={age_m:.0f}m")
             except Exception:
                 pass
             
             await asyncio.sleep(0.05)
         
         _mirror_save(MIRROR)
-        log.info(f"[Ingester] Mirror now has {len(MIRROR['tokens'])} tokens")
+        stats = mirror_stats()
+        log.info(f"[Ingester] 💾 Mirror saved: {stats['tokens']} tokens, {stats['pairs']} pairs")
         
     except Exception as e:
-        log.exception(f"[Ingester] Error: {e}")
+        log.exception(f"[Ingester] ❌ Error: {e}")
 
 def _pairs_from_mirror() -> List[dict]:
     rows = []
@@ -610,15 +622,17 @@ def build_caption(m: dict, followed_by: List[str], extras: List[str], is_update:
     price = float(m.get("price_usd") or 0)
     header = f"{fire_or_ice} <b>{html_escape(m['name'])}</b>"
     price_line = f"💵 <b>Price:</b> " + (f"${price:.8f}" if price < 1 else f"${price:,.4f}")
+    
     followed_by_line = ""
     if followed_by:
         links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in followed_by[:20]]
         followed_by_text = ", ".join(links)
         if len(followed_by) > 20:
             followed_by_text += f" ... +{len(followed_by) - 20} more"
-        followed_by_line = f"👥 <b>Followed by:</b> {followed_by_text}\n"
+        followed_by_line = f"𝕏 <b>Followed by:</b> {followed_by_text}\n"
     else:
-        followed_by_line = "👥 <b>Followed by:</b> —\n"
+        followed_by_line = "𝕏 <b>Followed by:</b> —\n"
+    
     extras_line = ""
     if extras:
         links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in extras[:15]]
@@ -626,10 +640,11 @@ def build_caption(m: dict, followed_by: List[str], extras: List[str], is_update:
         if len(extras) > 15:
             extras_text += f" ... +{len(extras) - 15} more"
         extras_line = f"➕ <b>Extras:</b> {extras_text}\n"
+    
     return (
         f"{header}\n"
-        f"🦄 <b>First Mcap:</b> 🔵 ${first:,.0f}\n"
-        f"🦄 <b>Current Mcap:</b> {circle} ${cur:,.0f} <b>({pct})</b>\n"
+        f"🏦 <b>First Mcap:</b> 🔵 ${first:,.0f}\n"
+        f"🏦 <b>Current Mcap:</b> {circle} ${cur:,.0f} <b>({pct})</b>\n"
         f"🖨️ <b>Mint:</b> <code>{html_escape(m['token'][:20])}...</code>\n"
         f"💧 <b>Liquidity:</b> ${m['liquidity_usd']:,.0f}\n"
         f"{price_line}\n"
@@ -829,7 +844,7 @@ async def cmd_scrape(u: Update, c: ContextTypes.DEFAULT_TYPE):
         extras = [h for h in usernames if h not in MY_HANDLES]
         response = f"✅ Found {len(usernames)} usernames\n📊 My handles loaded: {len(MY_HANDLES)}\n\n"
         if followed_by:
-            response += f"👥 Followed by ({len(followed_by)}):\n"
+            response += f"𝕏 Followed by ({len(followed_by)}):\n"
             response += ", ".join(f"@{h}" for h in followed_by[:30])
             if len(followed_by) > 30:
                 response += f"\n... +{len(followed_by) - 30} more"
@@ -887,12 +902,12 @@ application.add_handler(CommandHandler("scrape", cmd_scrape))
 application.add_handler(CommandHandler("handles", cmd_handles))
 application.add_handler(CommandHandler("clearcache", cmd_clearcache))
 
-app = FastAPI(title="Telegram Webhook")
+app = FastAPI(title="Telegram Webhook SOL")
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/")
 async def health_root():
-    return {"ok": True, "chain": CHAIN_ID, "api": "token-profiles", "twitter_scraper": TWITTER_SCRAPER_ENABLED}
+    return {"ok": True, "chain": CHAIN_ID, "api": "token-profiles"}
 
 @app.get("/healthz")
 async def healthz():
@@ -907,7 +922,6 @@ async def _startup():
     MIRROR = _mirror_load()
     MY_HANDLES = load_my_following()
     
-    # Initialize bot synchronously
     log.info("🤖 Initializing Telegram bot...")
     await application.initialize()
     log.info("✅ Bot initialized")
@@ -915,7 +929,6 @@ async def _startup():
     await application.start()
     log.info("✅ Bot started")
     
-    # Start background jobs
     jq = application.job_queue
     if jq:
         jq.run_repeating(ingester, interval=timedelta(seconds=INGEST_INTERVAL_SEC), first=timedelta(seconds=2), name="ingester")
@@ -925,7 +938,7 @@ async def _startup():
     else:
         log.error("⚠️ Job queue is None!")
     
-    log.info("✅✅✅ STARTUP COMPLETE - Bot ready to receive updates")
+    log.info("✅✅✅ STARTUP COMPLETE - Bot ready")
 
 @app.on_event("shutdown")
 async def _shutdown():
