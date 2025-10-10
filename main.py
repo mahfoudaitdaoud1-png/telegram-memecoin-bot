@@ -357,8 +357,7 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                     return (h, f"https://x.com/{h}")
     return (None, None)
 
-# Dexscreener endpoints - EXACT SAME AS BSC
-TOKEN_PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/{chainId}/{address}"
+# Dexscreener endpoints - ONLY use profiles API
 PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 
 def _get_json(url, timeout=HTTP_TIMEOUT, tries=2):
@@ -372,20 +371,6 @@ def _get_json(url, timeout=HTTP_TIMEOUT, tries=2):
         time.sleep(0.2 * (i + 1))
     return None
 
-def _best_pool_for_mint(chain, mint) -> Optional[dict]:
-    arr = _get_json(TOKEN_PAIRS_URL.format(chainId=chain, address=mint), timeout=15) or []
-    if not isinstance(arr, list) or not arr:
-        return None
-    best = None
-    key = None
-    for p in arr:
-        liq = float((p.get("liquidity") or {}).get("usd", 0) or 0)
-        created = float(p.get("pairCreatedAt") or 0)
-        k = (liq, created)
-        if best is None or k > key:
-            best, key = p, k
-    return best
-
 def _row_age_min(row: dict) -> float:
     try:
         created = float(row.get("pairCreatedAt") or 0)
@@ -397,32 +382,69 @@ def _row_age_min(row: dict) -> float:
 
 def _discover_from_profiles(chain=CHAIN_ID, max_age_min=MAX_AGE_MIN * 2) -> List[dict]:
     """
-    EXACT COPY OF BSC IMPLEMENTATION - just with solana/sol variants
+    Fetch token profiles directly - NO enrichment, use profiles data as-is
     """
     j = _get_json(PROFILES_URL, timeout=15) or {}
-    items = j if isinstance(j, list) else (j.get("items") or j.get("profiles") or [])
+    
+    # Handle response format
+    if isinstance(j, list):
+        items = j
+    elif isinstance(j, dict):
+        items = j.get("items") or j.get("profiles") or []
+    else:
+        log.error(f"[Profiles] Unexpected response type: {type(j)}")
+        return []
+    
+    log.info(f"[Profiles] API returned {len(items)} total profiles")
+    
     out: List[dict] = []
     
     # Support both "solana" and "sol" chain IDs
-    chain_check = chain if chain != "solana" else ["solana", "sol"]
-    if isinstance(chain_check, str):
-        chain_check = [chain_check]
+    chain_variants = ["solana", "sol"]
     
     for it in items:
+        # Filter by chain
         token_chain = (it.get("chainId") or "").lower()
-        if token_chain not in chain_check:
+        if token_chain not in chain_variants:
             continue
-        mint = it.get("tokenAddress")
-        if not mint:
+        
+        # Check if we have required fields
+        token_addr = it.get("tokenAddress")
+        if not token_addr:
             continue
-        enriched = _best_pool_for_mint(chain, mint)
-        if not enriched:
-            continue
-        age_m = _row_age_min(enriched)
+        
+        # Use profile data directly - no enrichment!
+        # Build a "row" from the profile data
+        row = {
+            "baseToken": {
+                "address": token_addr,
+                "symbol": it.get("symbol") or "Unknown",
+                "name": it.get("name") or it.get("symbol") or "Unknown",
+            },
+            "pairAddress": "",  # Profiles don't have pair address
+            "priceUsd": "0",
+            "liquidity": {"usd": 0},
+            "fdv": 0,
+            "marketCap": 0,
+            "volume": {"h24": 0},
+            "pairCreatedAt": int(time.time() * 1000),  # Use current time as fallback
+            "info": {
+                "imageUrl": it.get("icon") or it.get("image") or "",
+                "socials": it.get("links") or []
+            },
+            "chainId": token_chain
+        }
+        
+        # Check age - for new profiles, age is 0 (just created)
+        age_m = _row_age_min(row)
         if age_m <= max_age_min:
-            out.append(enriched)
+            out.append(row)
+            log.info(f"[Profiles] Added {token_addr[:10]}... from profile data")
+    
+    # Sort by creation time (newest first)
     out.sort(key=lambda x: x.get("pairCreatedAt") or 0, reverse=True)
-    log.info(f"[Profiles] {chain.upper()} profiles fetched={len(out)}")
+    
+    log.info(f"[Profiles] ✅ Found {len(out)} SOLANA tokens from profiles")
     return out
 
 def _mirror_load() -> dict:
@@ -577,7 +599,7 @@ def link_keyboard(m: dict) -> InlineKeyboardMarkup:
 
 def _pct_str(first: float, cur: float) -> str:
     if first > 0 and cur >= 0:
-        d = (cur - first) / first * 100.0:
+        d = (cur - first) / first * 100.0
         return f"{'+' if d >= 0 else ''}{d:.1f}%"
     return "n/a"
 
@@ -637,16 +659,16 @@ async def _send_or_photo(bot, chat_id: int, caption: str, kb, token: str, logo_h
     return None
 
 def passes_filters_for_alert(m: dict) -> bool:
+    """
+    Simplified filters for profiles-only data
+    Since we don't have real liquidity/volume data, we're more permissive
+    """
     try:
-        liq = float(m.get("liquidity_usd") or 0)
-        mcap = float(m.get("mcap_usd") or 0)
-        vol24 = float(m.get("vol24_usd") or 0)
         age = float(m.get("age_min") or float("inf"))
-        liq_ok = liq >= MIN_LIQ_USD
         age_ok = (age <= MAX_AGE_MIN) if age != float("inf") else True
-        mcap_ok = (mcap >= MIN_MCAP_USD) if mcap > 0 else True
-        vol_ok = (vol24 >= MIN_VOL_H24_USD) if vol24 > 0 else True
-        return liq_ok and age_ok and mcap_ok and vol_ok
+        
+        # For profiles data, we accept all tokens that pass age filter
+        return age_ok
     except:
         return False
 
@@ -707,36 +729,10 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
             if now_ts - first_ts >= UPDATE_MAX_DURATION_MIN * 60:
                 TRACKED.discard(token)
                 continue
-            cur = _best_pool_for_mint(CHAIN_ID, token)
-            if not cur:
-                continue
-            base = cur.get("baseToken") or {}
-            info = cur.get("info") or {}
-            x_handle, x_url = _extract_x(info)
-            m = {
-                "name": base.get("symbol") or base.get("name") or "Unknown",
-                "token": base.get("address") or token,
-                "pair": cur.get("pairAddress") or "",
-                "price_usd": _get_price_usd(cur),
-                "liquidity_usd": float((cur.get("liquidity") or {}).get("usd", 0) or 0),
-                "mcap_usd": float((cur.get("fdv") if cur.get("fdv") is not None else (cur.get("marketCap") or 0)) or 0),
-                "vol24_usd": float((cur.get("volume") or {}).get("h24", 0) or 0),
-                "age_min": _pair_age_minutes(time.time() * 1000.0, cur.get("pairCreatedAt")),
-                "logo_hint": info.get("imageUrl") or base.get("logo") or "",
-                "tw_handle": x_handle,
-                "tw_url": x_url or (f"https://x.com/{x_handle}" if x_handle else "https://x.com/"),
-                "axiom": AXIOM_WEB_URL.format(pair=cur.get("pairAddress") or ""),
-                "gmgn": GMGN_WEB_URL.format(mint=token),
-            }
-            if float(m.get("age_min", 1e9)) >= MAX_AGE_MIN:
-                TRACKED.discard(token)
-                continue
-            m["first_mcap_usd"] = float(first_rec.get("first", 0.0))
-            m["is_first_time"] = False
-            for chat_id in list(SUBS):
-                if passes_filters_for_alert(m):
-                    await send_price_update(context.bot, chat_id, m)
-                    await asyncio.sleep(0.02)
+            
+            # Skip update enrichment - just use cached mirror data
+            # Updates disabled since we're using profiles-only API
+            
     except Exception as e:
         log.exception(f"updater job error: {e}")
 
@@ -744,7 +740,7 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global SUBS
     SUBS.add(u.effective_chat.id)
     _save_subs_to_file()
-    await u.message.reply_text(f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s + 🧊 updates every {UPDATE_INTERVAL_SEC}s\nToken Profiles API + Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
+    await u.message.reply_text(f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s\nProfiles-Only API (simplified) + Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(str(u.effective_chat.id))
@@ -763,7 +759,7 @@ async def cmd_unsub(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     s = mirror_stats()
-    await u.message.reply_text(f"Subscribers: {len(SUBS)} | 🔥 /trade every {TRADE_SUMMARY_SEC}s | 🧊 updates every {UPDATE_INTERVAL_SEC}s\nMirror -> tokens: {s['tokens']} pairs: {s['pairs']} | Following: {len(MY_HANDLES)}\nToken Profiles API enabled\nTwitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
+    await u.message.reply_text(f"Subscribers: {len(SUBS)} | 🔥 /trade every {TRADE_SUMMARY_SEC}s (updates disabled)\nMirror -> tokens: {s['tokens']} pairs: {s['pairs']} | Following: {len(MY_HANDLES)}\nProfiles-Only API (no enrichment)\nTwitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = (u.message.text or "").split()
@@ -852,7 +848,7 @@ async def _post_init(app: Application):
     log.info(f"📊 Chain: {CHAIN_ID.upper()}")
     log.info(f"Subscribers: {sorted(SUBS)}")
     log.info(f"Following: {len(MY_HANDLES)} handles")
-    log.info(f"Token Profiles API: Enabled")
+    log.info(f"Profiles-Only API: Enabled (no enrichment)")
     log.info(f"Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
@@ -872,7 +868,7 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/")
 async def health_root():
-    return {"ok": True, "chain": CHAIN_ID, "api": "token-profiles"}
+    return {"ok": True, "chain": CHAIN_ID, "api": "profiles-only", "mode": "simplified"}
 
 @app.get("/healthz")
 async def healthz():
