@@ -228,7 +228,10 @@ def _get_price_usd(p: dict) -> float:
 # -----------------------------------------------------------------------------
 # Dexscreener fetchers
 # -----------------------------------------------------------------------------
+# DexScreener API - ONLY using TOKEN_PROFILES_URL
+# -----------------------------------------------------------------------------
 TOKEN_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+# Below APIs are NOT used - only profiles API above
 TOKENS_URL         = "https://api.dexscreener.com/tokens/v1/{chainId}/{addresses}"
 SEARCH_NEW_URL     = "https://api.dexscreener.com/latest/dex/search?q=chain:{chain}%20new"
 SEARCH_ALL_URL     = "https://api.dexscreener.com/latest/dex/search?q=chain:{chain}"
@@ -328,18 +331,14 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     try:
-        for r in _discover_search_new(CHAIN_ID):
-            mint, pair, created = _normalize_row_to_token(r)
-            if pair: mirror_upsert_pair(pair, CHAIN_ID, created, r)
-            if mint: mirror_upsert_token(mint, pair, created, r)
-
-        for r in _discover_search_all(CHAIN_ID):
-            mint, pair, created = _normalize_row_to_token(r)
-            if pair: mirror_upsert_pair(pair, CHAIN_ID, created, r)
-            if mint: mirror_upsert_token(mint, pair, created, r)
-
+        log.info("[ingester] Using ONLY profiles API")
+        
+        # ONLY use profiles API - nothing else
         mints = _discover_profiles_latest(CHAIN_ID)
-        for mint in mints[:60]:
+        log.info(f"[ingester] Profiles API returned {len(mints)} {CHAIN_ID} tokens")
+        
+        for mint in mints:
+            # Get best pool for this token
             best = _best_pool_for_mint(CHAIN_ID, mint)
             if best:
                 mint_b, pair_b, created_b = _normalize_row_to_token(best)
