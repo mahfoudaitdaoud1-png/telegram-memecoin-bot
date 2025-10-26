@@ -241,10 +241,29 @@ PAIR_REFRESH_URL   = "https://api.dexscreener.com/latest/dex/pairs/{chainId}/{pa
 def _get_json(url, timeout=HTTP_TIMEOUT, tries=2):
     for i in range(tries):
         try:
+            log.debug(f"[API] GET {url} (attempt {i+1}/{tries})")
             r = SESSION.get(url, timeout=timeout)
-            if r.status_code == 200: return r.json()
-        except Exception: pass
+            log.debug(f"[API] Status: {r.status_code}, Content-Length: {len(r.content)}")
+            
+            if r.status_code == 200: 
+                data = r.json()
+                log.debug(f"[API] ✓ Success - returned {type(data)}")
+                return data
+            else:
+                log.warning(f"[API] ✗ Status {r.status_code} for {url}")
+                
+        except requests.exceptions.Timeout:
+            log.warning(f"[API] ✗ Timeout on {url}")
+        except requests.exceptions.ConnectionError:
+            log.warning(f"[API] ✗ Connection error on {url}")
+        except json.JSONDecodeError as e:
+            log.warning(f"[API] ✗ JSON decode error on {url}: {e}")
+        except Exception as e:
+            log.warning(f"[API] ✗ Unexpected error on {url}: {e}")
+            
         time.sleep(0.2*(i+1))
+    
+    log.error(f"[API] ❌ Failed after {tries} attempts: {url}")
     return None
 
 def _discover_search_new(chain=CHAIN_ID) -> List[dict]:
@@ -256,18 +275,45 @@ def _discover_search_all(chain=CHAIN_ID) -> List[dict]:
     return j.get("pairs",[]) if isinstance(j,dict) else []
 
 def _discover_profiles_latest(chain=CHAIN_ID) -> List[str]:
+    log.info(f"[DEBUG] Calling profiles API: {TOKEN_PROFILES_URL}")
     arr = _get_json(TOKEN_PROFILES_URL, timeout=15) or []
-    return [x.get("tokenAddress") for x in arr if isinstance(x,dict) and (x.get("chainId") or "").lower()==chain]
+    log.info(f"[DEBUG] Profiles API response type: {type(arr)}")
+    log.info(f"[DEBUG] Profiles API returned {len(arr) if isinstance(arr, list) else 'N/A'} total items")
+    
+    if isinstance(arr, list) and len(arr) > 0:
+        # Show first item as example
+        log.info(f"[DEBUG] First item sample: {json.dumps(arr[0], indent=2)[:300]}")
+    
+    # Filter for our chain
+    result = [x.get("tokenAddress") for x in arr if isinstance(x,dict) and (x.get("chainId") or "").lower()==chain]
+    log.info(f"[DEBUG] After filtering for chain '{chain}': {len(result)} tokens")
+    
+    if len(result) > 0:
+        log.info(f"[DEBUG] First 3 token addresses: {result[:3]}")
+    
+    return result
 
 def _best_pool_for_mint(chain, mint) -> Optional[dict]:
-    arr = _get_json(TOKEN_PAIRS_URL.format(chainId=chain, address=mint), timeout=15) or []
-    if not isinstance(arr,list) or not arr: return None
+    url = TOKEN_PAIRS_URL.format(chainId=chain, address=mint)
+    log.info(f"[DEBUG] Fetching pairs for {mint[:10]}... from {url}")
+    arr = _get_json(url, timeout=15) or []
+    log.info(f"[DEBUG] Got {len(arr) if isinstance(arr, list) else 'N/A'} pairs for {mint[:10]}...")
+    
+    if not isinstance(arr,list) or not arr: 
+        log.warning(f"[DEBUG] No pairs found for {mint[:10]}...")
+        return None
+    
     best=None; key=None
     for p in arr:
         liq = float((p.get("liquidity") or {}).get("usd",0) or 0)
         created = float(p.get("pairCreatedAt") or 0)
         k = (liq, created)
         if best is None or k > key: best, key = p, k
+    
+    if best:
+        liq = float((best.get("liquidity") or {}).get("usd",0) or 0)
+        log.info(f"[DEBUG] Best pair for {mint[:10]}... has ${liq:,.0f} liquidity")
+    
     return best
 
 def _tokens_batch(chain, mints: List[str]) -> List[dict]:
@@ -331,25 +377,53 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     try:
-        log.info("[ingester] Using ONLY profiles API")
+        log.info("=" * 60)
+        log.info("[ingester] Starting ingester cycle - Using ONLY profiles API")
+        log.info("=" * 60)
         
         # ONLY use profiles API - nothing else
         mints = _discover_profiles_latest(CHAIN_ID)
-        log.info(f"[ingester] Profiles API returned {len(mints)} {CHAIN_ID} tokens")
+        log.info(f"[ingester] ✓ Profiles API returned {len(mints)} {CHAIN_ID} tokens")
         
-        for mint in mints:
+        if len(mints) == 0:
+            log.warning("[ingester] ⚠️ No tokens returned from profiles API!")
+            log.warning("[ingester] This could mean:")
+            log.warning("[ingester]   1. No Solana tokens have profiles right now")
+            log.warning("[ingester]   2. API is rate limiting")
+            log.warning("[ingester]   3. Network issue")
+            return
+        
+        processed = 0
+        failed = 0
+        
+        for i, mint in enumerate(mints):
+            log.info(f"[ingester] Processing token {i+1}/{len(mints)}: {mint[:10]}...")
+            
             # Get best pool for this token
             best = _best_pool_for_mint(CHAIN_ID, mint)
             if best:
                 mint_b, pair_b, created_b = _normalize_row_to_token(best)
-                if pair_b: mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
-                if mint_b: mirror_upsert_token(mint_b, pair_b, created_b, best)
+                if pair_b: 
+                    mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
+                    log.info(f"[ingester]   ✓ Added pair {pair_b[:10]}...")
+                if mint_b: 
+                    mirror_upsert_token(mint_b, pair_b, created_b, best)
+                    log.info(f"[ingester]   ✓ Added token {mint_b[:10]}...")
+                processed += 1
+            else:
+                log.warning(f"[ingester]   ✗ No pool found for {mint[:10]}...")
+                failed += 1
 
         _mirror_save(MIRROR)
         s = mirror_stats()
-        log.info(f"[ingester] mirror stats: tokens={s['tokens']} pairs={s['pairs']}")
+        log.info("=" * 60)
+        log.info(f"[ingester] ✅ Ingester complete!")
+        log.info(f"[ingester] Processed: {processed}/{len(mints)} tokens")
+        log.info(f"[ingester] Failed: {failed}/{len(mints)} tokens")
+        log.info(f"[ingester] Mirror stats: tokens={s['tokens']} pairs={s['pairs']}")
+        log.info("=" * 60)
     except Exception as e:
-        log.exception(f"[ingester] error: {e}")
+        log.exception(f"[ingester] ❌ ERROR: {e}")
 
 # -----------------------------------------------------------------------------
 # Mirror -> pairs rows
