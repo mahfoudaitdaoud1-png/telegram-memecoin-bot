@@ -382,66 +382,44 @@ def _row_age_min(row: dict) -> float:
 
 def _discover_from_profiles(chain=CHAIN_ID, max_age_min=MAX_AGE_MIN * 2) -> List[dict]:
     """
-    Discover new tokens using multiple DexScreener API endpoints:
-    1. Token boosts (promoted tokens - usually new launches)
-    2. Token profiles (submitted profiles)
-    3. For each discovered token, fetch actual pair data with real metrics
+    Fetch tokens from profiles API and enrich with real pair data
+    Profiles API is efficient for detecting new tokens
     """
-    discovered_tokens = []
-    seen_addresses = set()
-    
-    # Method 1: Fetch boosted/promoted tokens (best for new launches)
-    log.info(f"[Discovery] Fetching boosted tokens...")
-    boosted_url = "https://api.dexscreener.com/token-boosts/latest/v1"
-    boosted_data = _get_json(boosted_url, timeout=15) or {}
-    
-    if isinstance(boosted_data, list):
-        boosted_items = boosted_data
-    elif isinstance(boosted_data, dict):
-        boosted_items = boosted_data.get("items", []) or boosted_data.get("boosted", [])
-    else:
-        boosted_items = []
-    
-    log.info(f"[Discovery] Found {len(boosted_items)} boosted tokens")
-    
-    for item in boosted_items:
-        token_chain = (item.get("chainId") or "").lower()
-        if token_chain not in ["solana", "sol"]:
-            continue
-        token_addr = item.get("tokenAddress")
-        if token_addr and token_addr not in seen_addresses:
-            discovered_tokens.append(token_addr)
-            seen_addresses.add(token_addr)
-    
-    # Method 2: Fetch token profiles
-    log.info(f"[Discovery] Fetching token profiles...")
-    profiles_url = "https://api.dexscreener.com/token-profiles/latest/v1"
-    profiles_data = _get_json(profiles_url, timeout=15) or {}
-    
-    if isinstance(profiles_data, list):
-        profile_items = profiles_data
-    elif isinstance(profiles_data, dict):
-        profile_items = profiles_data.get("items", []) or profiles_data.get("profiles", [])
-    else:
-        profile_items = []
-    
-    log.info(f"[Discovery] Found {len(profile_items)} token profiles")
-    
-    for item in profile_items:
-        token_chain = (item.get("chainId") or "").lower()
-        if token_chain not in ["solana", "sol"]:
-            continue
-        token_addr = item.get("tokenAddress")
-        if token_addr and token_addr not in seen_addresses:
-            discovered_tokens.append(token_addr)
-            seen_addresses.add(token_addr)
-    
-    log.info(f"[Discovery] Total unique tokens discovered: {len(discovered_tokens)}")
-    
-    # Method 3: Fetch actual pair data for discovered tokens
     out: List[dict] = []
     
-    for token_addr in discovered_tokens:
+    # Fetch latest token profiles - this is the main source
+    profiles_url = "https://api.dexscreener.com/token-profiles/latest/v1"
+    log.info(f"[Discovery] Fetching token profiles from DexScreener...")
+    
+    profiles_data = _get_json(profiles_url, timeout=15)
+    if not profiles_data:
+        log.warning("[Discovery] No response from profiles API")
+        return []
+    
+    # Handle different response formats
+    if isinstance(profiles_data, list):
+        items = profiles_data
+    elif isinstance(profiles_data, dict):
+        items = profiles_data.get("items", []) or profiles_data.get("profiles", [])
+    else:
+        log.error(f"[Discovery] Unexpected response type: {type(profiles_data)}")
+        return []
+    
+    log.info(f"[Discovery] Profiles API returned {len(items)} total tokens")
+    
+    # Filter for Solana tokens and fetch their pair data
+    solana_tokens = []
+    for item in items:
+        token_chain = (item.get("chainId") or "").lower()
+        if token_chain in ["solana", "sol"]:
+            token_addr = item.get("tokenAddress")
+            if token_addr:
+                solana_tokens.append(token_addr)
+    
+    log.info(f"[Discovery] Found {len(solana_tokens)} Solana tokens in profiles")
+    
+    # Fetch pair data for each Solana token
+    for token_addr in solana_tokens:
         # Get trading pairs for this token
         pairs_url = f"https://api.dexscreener.com/latest/dex/tokens/solana/{token_addr}"
         pairs_data = _get_json(pairs_url, timeout=10)
@@ -453,30 +431,32 @@ def _discover_from_profiles(chain=CHAIN_ID, max_age_min=MAX_AGE_MIN * 2) -> List
         if not pairs:
             continue
         
-        # Take the pair with highest liquidity
+        # Use the pair with highest liquidity
         pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0), reverse=True)
         best_pair = pairs[0]
         
-        # Check age
-        age_m = _row_age_min(best_pair)
-        if age_m > max_age_min:
-            continue
-        
-        # Check if it's actually a Solana pair
+        # Verify it's a Solana pair
         pair_chain = (best_pair.get("chainId") or "").lower()
         if pair_chain not in ["solana", "sol"]:
             continue
         
+        # Check age filter
+        age_m = _row_age_min(best_pair)
+        if age_m > max_age_min:
+            continue
+        
+        # Add to results
+        liq = float((best_pair.get("liquidity") or {}).get("usd", 0) or 0)
         out.append(best_pair)
-        log.info(f"[Discovery] Added {token_addr[:10]}... with real pair data (age: {age_m:.0f}m)")
+        log.info(f"[Discovery] ✓ Added {token_addr[:10]}... age={age_m:.0f}m liq=${liq:,.0f}")
         
         # Small delay to avoid rate limits
-        time.sleep(0.1)
+        time.sleep(0.05)
     
     # Sort by creation time (newest first)
     out.sort(key=lambda x: x.get("pairCreatedAt") or 0, reverse=True)
     
-    log.info(f"[Discovery] ✅ Found {len(out)} SOLANA tokens with valid pair data")
+    log.info(f"[Discovery] ✅ Successfully enriched {len(out)}/{len(solana_tokens)} Solana tokens with pair data")
     return out
 
 def _mirror_load() -> dict:
@@ -522,7 +502,7 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     try:
-        log.info(f"[Ingester] Starting discovery via multi-source API (boosted + profiles) for chain={CHAIN_ID}")
+        log.info(f"[Ingester] Starting discovery via profiles API for chain={CHAIN_ID}")
         rows = _discover_from_profiles(CHAIN_ID)
         log.info(f"[Ingester] {len(rows)} enriched {CHAIN_ID.upper()} tokens found")
         for r in rows:
@@ -788,7 +768,7 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global SUBS
     SUBS.add(u.effective_chat.id)
     _save_subs_to_file()
-    await u.message.reply_text(f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s\nMulti-source discovery (boosted + profiles) + Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
+    await u.message.reply_text(f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s\nProfiles API (with real pair data) + Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(str(u.effective_chat.id))
@@ -807,7 +787,7 @@ async def cmd_unsub(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     s = mirror_stats()
-    await u.message.reply_text(f"Subscribers: {len(SUBS)} | 🔥 /trade every {TRADE_SUMMARY_SEC}s (updates disabled)\nMirror -> tokens: {s['tokens']} pairs: {s['pairs']} | Following: {len(MY_HANDLES)}\nMulti-source discovery (boosted + profiles with real pair data)\nTwitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
+    await u.message.reply_text(f"Subscribers: {len(SUBS)} | 🔥 /trade every {TRADE_SUMMARY_SEC}s (updates disabled)\nMirror -> tokens: {s['tokens']} pairs: {s['pairs']} | Following: {len(MY_HANDLES)}\nProfiles API (with real pair data enrichment)\nTwitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = (u.message.text or "").split()
@@ -896,7 +876,7 @@ async def _post_init(app: Application):
     log.info(f"📊 Chain: {CHAIN_ID.upper()}")
     log.info(f"Subscribers: {sorted(SUBS)}")
     log.info(f"Following: {len(MY_HANDLES)} handles")
-    log.info(f"Multi-source API: Enabled (boosted + profiles with real pair data)")
+    log.info(f"Profiles API: Enabled (enriched with real pair data)")
     log.info(f"Twitter scraper: {'Enabled' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
@@ -916,7 +896,7 @@ app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/")
 async def health_root():
-    return {"ok": True, "chain": CHAIN_ID, "api": "multi-source", "mode": "real-pair-data"}
+    return {"ok": True, "chain": CHAIN_ID, "api": "profiles", "mode": "enriched-pair-data"}
 
 @app.get("/healthz")
 async def healthz():
