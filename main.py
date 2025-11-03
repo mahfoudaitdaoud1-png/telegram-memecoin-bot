@@ -211,7 +211,15 @@ def _handle_from_url(u: str) -> Optional[str]:
     except: return None
 
 def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract Twitter/X info from token metadata.
+    Returns (handle, url) where url can be:
+    - Profile: https://x.com/username
+    - Community: https://x.com/i/communities/1234567890
+    """
     if not isinstance(info, dict): return (None, None)
+    
+    # Check socials/links/websites arrays
     for key in ("socials","links","websites"):
         arr = info.get(key)
         if isinstance(arr, list):
@@ -220,17 +228,39 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                 url = it.get("url") or it.get("link")
                 plat = (it.get("platform") or it.get("type") or it.get("label") or "").lower()
                 handle = it.get("handle")
+                
+                # Check if this is a Twitter/X link
                 if url and ("twitter" in url.lower() or "x.com" in url.lower() or "twitter" in plat or "x" == plat):
                     u = _canon_url(url)
+                    
+                    # If it's a community link, return as-is (no handle extraction)
+                    if "/i/communities/" in u.lower():
+                        return (None, u)  # No handle for community links
+                    
+                    # Otherwise extract handle from profile URL
                     h = _handle_from_url(u) or _normalize_handle(handle or "")
                     return (h, u)
+    
+    # Check direct fields
     for key in ("twitterUrl","twitter","x","twitterHandle"):
         v = info.get(key)
         if isinstance(v, str) and v.strip():
             if v.lower().startswith("http"):
-                u=_canon_url(v); return (_handle_from_url(u), u)
-            h=_normalize_handle(v)
-            if h: return (h, f"https://x.com/{h}")
+                u = _canon_url(v)
+                
+                # Community link - return as-is
+                if "/i/communities/" in u.lower():
+                    return (None, u)
+                
+                # Profile link - extract handle
+                h = _handle_from_url(u)
+                return (h, u)
+            
+            # Plain handle - construct profile URL
+            h = _normalize_handle(v)
+            if h: 
+                return (h, f"https://x.com/{h}")
+    
     return (None, None)
 
 def _get_price_usd(p: dict) -> float:
@@ -461,11 +491,20 @@ def _pairs_from_mirror() -> List[dict]:
         url   = _valid_url(row.get("url") or (DEXSCREENER_PAIR_URL.format(pair=pair) if pair else ""))
         age_m = _pair_age_minutes(now_ms, row.get("pairCreatedAt"))
         x_handle, x_url = _extract_x(info)
+        
+        # Build Twitter URL properly - prefer full URL over constructed handle URL
+        if x_url:
+            tw_final = _valid_url(x_url)  # Use full URL (profile or community)
+        elif x_handle:
+            tw_final = X_USER_URL.format(handle=x_handle)  # Construct from handle
+        else:
+            tw_final = "https://x.com/"  # Fallback
+        
         rows.append({
             "name": name, "token": token, "pair": pair, "price_usd": price,
             "liquidity_usd": liq, "mcap_usd": mcap, "vol24_usd": vol24, "age_min": age_m,
             "url": url, "logo_hint": info.get("imageUrl") or base.get("logo") or "",
-            "tw_url": _valid_url(x_url) or (X_USER_URL.format(handle=x_handle) if x_handle else "https://x.com/"),
+            "tw_url": tw_final,
             "tw_handle": x_handle,
             "axiom": AXIOM_WEB_URL.format(pair=pair) if pair else "https://axiom.trade/",
             "gmgn": GMGN_WEB_URL.format(mint=token) if token else "https://gmgn.ai/",
