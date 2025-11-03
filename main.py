@@ -222,13 +222,26 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                 handle = it.get("handle")
                 if url and ("twitter" in url.lower() or "x.com" in url.lower() or "twitter" in plat or "x" == plat):
                     u = _canon_url(url)
+                    
+                    # For community URLs, return full URL without extracting handle
+                    if "/i/communities/" in u.lower() or "/communities/" in u.lower():
+                        return (None, u)  # No handle for community links
+                    
+                    # For regular profile URLs, extract handle
                     h = _handle_from_url(u) or _normalize_handle(handle or "")
                     return (h, u)
     for key in ("twitterUrl","twitter","x","twitterHandle"):
         v = info.get(key)
         if isinstance(v, str) and v.strip():
             if v.lower().startswith("http"):
-                u=_canon_url(v); return (_handle_from_url(u), u)
+                u=_canon_url(v)
+                
+                # For community URLs, return full URL
+                if "/i/communities/" in u.lower() or "/communities/" in u.lower():
+                    return (None, u)
+                
+                # For regular profile URLs, extract handle
+                return (_handle_from_url(u), u)
             h=_normalize_handle(v)
             if h: return (h, f"https://x.com/{h}")
     return (None, None)
