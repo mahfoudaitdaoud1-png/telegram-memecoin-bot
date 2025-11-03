@@ -673,15 +673,15 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     header = f"{fire_or_ice} <b>{html_escape(m['name'])}</b>"
     price_line = f"💵 <b>Price:</b> " + (f"${price:.8f}" if price < 1 else f"${price:,.4f}")
     return (
-        f"{header}\\n"
-        f"{BANK} <b>First Mcap:</b> {BLUE} ${first:,.0f}\\n"
-        f"{BANK} <b>Current Mcap:</b> {circle} ${cur:,.0f} <b>({pct})</b>\\n"
-        f"🖨️ <b>Mint:</b> <code>{html_escape(m['token'])}</code>\\n"
-        f"🔗 <b>Pair:</b> <code>{html_escape(m['pair'])}</code>\\n"
-        f"💧 <b>Liquidity:</b> ${m['liquidity_usd']:,.0f}\\n"
-        f"{price_line}\\n"
-        f"📈 <b>Vol 24h:</b> ${m['vol24_usd']:,.0f}\\n"
-        f"⏱️ <b>Age:</b> {int(m['age_min'])} min\\n"
+        f"{header}\n"
+        f"{BANK} <b>First Mcap:</b> {BLUE} ${first:,.0f}\n"
+        f"{BANK} <b>Current Mcap:</b> {circle} ${cur:,.0f} <b>({pct})</b>\n"
+        f"🖨️ <b>Mint:</b> <code>{html_escape(m['token'])}</code>\n"
+        f"🔗 <b>Pair:</b> <code>{html_escape(m['pair'])}</code>\n"
+        f"💧 <b>Liquidity:</b> ${m['liquidity_usd']:,.0f}\n"
+        f"{price_line}\n"
+        f"📈 <b>Vol 24h:</b> ${m['vol24_usd']:,.0f}\n"
+        f"⏱️ <b>Age:</b> {int(m['age_min'])} min\n"
         f"{XEMO} <b>Followed by:</b> {html_escape(fb_text)}"
     )
 
@@ -824,27 +824,14 @@ async def do_trade_push(bot):
     except Exception as e:
         log.exception(f"do_trade_push error: {e}")
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        log.info(f"🔥 [auto_trade] FIRED! (interval={TRADE_SUMMARY_SEC}s, subs={len(SUBS)})")
-        if len(SUBS) == 0:
-            log.warning("[auto_trade] NO SUBSCRIBERS - skipping")
-            return
-        await do_trade_push(context.bot)
-        log.info(f"🔥 [auto_trade] Complete")
-    except Exception as e:
-        log.exception(f"[auto_trade] ERROR: {e}")
-
+    log.info(f"🔥 [tick] auto_trade fired (interval={TRADE_SUMMARY_SEC}s)")
+    await do_trade_push(context.bot)
 async def updater(context: ContextTypes.DEFAULT_TYPE):
+    log.info(f"🧊 [tick] updater fired (interval={UPDATE_INTERVAL_SEC}s)")
     try:
-        log.info(f"🧊 [updater] FIRED! (interval={UPDATE_INTERVAL_SEC}s, tracked={len(TRACKED)}, subs={len(SUBS)})")
-        if len(SUBS) == 0:
-            log.warning("[updater] NO SUBSCRIBERS - skipping")
-            return
-        if not TRACKED: 
-            log.info("[updater] No tracked tokens yet - skipping")
-            return
+        if not TRACKED: return
         now_ts=int(time.time())
-        log.info(f"[updater] Refreshing {len(TRACKED)} tracked tokens")
+        log.info(f"[updater] refreshing {len(TRACKED)} tracked tokens")
         for token in list(TRACKED):
             first_rec = FIRST_SEEN.get(token) or {}
             first_ts = int(first_rec.get("ts", now_ts))
@@ -877,9 +864,8 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
                 if passes_filters_for_alert(m):
                     await send_price_update(context.bot, chat_id, m)
                     await asyncio.sleep(0.02)
-        log.info(f"🧊 [updater] Complete")
     except Exception as e:
-        log.exception(f"[updater] ERROR: {e}")
+        log.exception(f"updater job error: {e}")
 
 # -----------------------------------------------------------------------------
 # Commands
@@ -1053,35 +1039,15 @@ async def _startup():
 
 async def _start_bot_and_jobs():
     try:
-        log.info("=" * 80)
-        log.info("[STARTUP] Initializing application...")
         await application.initialize()
-        
         jq = application.job_queue
-        log.info(f"[STARTUP] Job queue: {jq}")
-        
-        log.info(f"[STARTUP] Registering ingester job (every {INGEST_INTERVAL_SEC}s)...")
         jq.run_repeating(ingester, interval=timedelta(seconds=INGEST_INTERVAL_SEC), first=timedelta(seconds=2), name="ingester")
-        
-        log.info(f"[STARTUP] Registering auto_trade job (every {TRADE_SUMMARY_SEC}s)...")
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
-        
-        log.info(f"[STARTUP] Registering updater job (every {UPDATE_INTERVAL_SEC}s)...")
         jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
-        
-        log.info("[STARTUP] Starting application...")
         await application.start()
-        
-        log.info("=" * 80)
-        log.info("[STARTUP] ✅ Bot initialized & started successfully!")
-        log.info(f"[STARTUP] Subscribers: {len(SUBS)} | ALERT_CHAT_ID: {ALERT_CHAT_ID}")
-        log.info(f"[STARTUP] Jobs registered:")
-        log.info(f"  - ingester: every {INGEST_INTERVAL_SEC}s")
-        log.info(f"  - auto_trade: every {TRADE_SUMMARY_SEC}s")  
-        log.info(f"  - updater: every {UPDATE_INTERVAL_SEC}s")
-        log.info("=" * 80)
+        log.info("Bot initialized & started")
     except Exception as e:
-        log.exception("❌ [STARTUP] Bot startup FAILED: %r", e)
+        log.exception("Bot startup failed: %r", e)
 
 @app.on_event("shutdown")
 async def _shutdown():
