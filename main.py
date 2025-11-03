@@ -1,4 +1,3 @@
-Try AI directly in your favorite apps … Use Gemini to generate drafts and refine content, plus get Gemini Pro with access to Google's next-gen AI for MAD 239.99 MAD 0 for 1 month
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -229,7 +228,10 @@ def _get_price_usd(p: dict) -> float:
 # -----------------------------------------------------------------------------
 # Dexscreener fetchers
 # -----------------------------------------------------------------------------
+# DexScreener API - ONLY using TOKEN_PROFILES_URL
+# -----------------------------------------------------------------------------
 TOKEN_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+# Below APIs are NOT used - only profiles API above
 TOKENS_URL         = "https://api.dexscreener.com/tokens/v1/{chainId}/{addresses}"
 SEARCH_NEW_URL     = "https://api.dexscreener.com/latest/dex/search?q=chain:{chain}%20new"
 SEARCH_ALL_URL     = "https://api.dexscreener.com/latest/dex/search?q=chain:{chain}"
@@ -239,10 +241,29 @@ PAIR_REFRESH_URL   = "https://api.dexscreener.com/latest/dex/pairs/{chainId}/{pa
 def _get_json(url, timeout=HTTP_TIMEOUT, tries=2):
     for i in range(tries):
         try:
+            log.debug(f"[API] GET {url} (attempt {i+1}/{tries})")
             r = SESSION.get(url, timeout=timeout)
-            if r.status_code == 200: return r.json()
-        except Exception: pass
+            log.debug(f"[API] Status: {r.status_code}, Content-Length: {len(r.content)}")
+            
+            if r.status_code == 200: 
+                data = r.json()
+                log.debug(f"[API] ✓ Success - returned {type(data)}")
+                return data
+            else:
+                log.warning(f"[API] ✗ Status {r.status_code} for {url}")
+                
+        except requests.exceptions.Timeout:
+            log.warning(f"[API] ✗ Timeout on {url}")
+        except requests.exceptions.ConnectionError:
+            log.warning(f"[API] ✗ Connection error on {url}")
+        except json.JSONDecodeError as e:
+            log.warning(f"[API] ✗ JSON decode error on {url}: {e}")
+        except Exception as e:
+            log.warning(f"[API] ✗ Unexpected error on {url}: {e}")
+            
         time.sleep(0.2*(i+1))
+    
+    log.error(f"[API] ❌ Failed after {tries} attempts: {url}")
     return None
 
 def _discover_search_new(chain=CHAIN_ID) -> List[dict]:
@@ -254,18 +275,45 @@ def _discover_search_all(chain=CHAIN_ID) -> List[dict]:
     return j.get("pairs",[]) if isinstance(j,dict) else []
 
 def _discover_profiles_latest(chain=CHAIN_ID) -> List[str]:
+    log.info(f"[DEBUG] Calling profiles API: {TOKEN_PROFILES_URL}")
     arr = _get_json(TOKEN_PROFILES_URL, timeout=15) or []
-    return [x.get("tokenAddress") for x in arr if isinstance(x,dict) and (x.get("chainId") or "").lower()==chain]
+    log.info(f"[DEBUG] Profiles API response type: {type(arr)}")
+    log.info(f"[DEBUG] Profiles API returned {len(arr) if isinstance(arr, list) else 'N/A'} total items")
+    
+    if isinstance(arr, list) and len(arr) > 0:
+        # Show first item as example
+        log.info(f"[DEBUG] First item sample: {json.dumps(arr[0], indent=2)[:300]}")
+    
+    # Filter for our chain
+    result = [x.get("tokenAddress") for x in arr if isinstance(x,dict) and (x.get("chainId") or "").lower()==chain]
+    log.info(f"[DEBUG] After filtering for chain '{chain}': {len(result)} tokens")
+    
+    if len(result) > 0:
+        log.info(f"[DEBUG] First 3 token addresses: {result[:3]}")
+    
+    return result
 
 def _best_pool_for_mint(chain, mint) -> Optional[dict]:
-    arr = _get_json(TOKEN_PAIRS_URL.format(chainId=chain, address=mint), timeout=15) or []
-    if not isinstance(arr,list) or not arr: return None
+    url = TOKEN_PAIRS_URL.format(chainId=chain, address=mint)
+    log.info(f"[DEBUG] Fetching pairs for {mint[:10]}... from {url}")
+    arr = _get_json(url, timeout=15) or []
+    log.info(f"[DEBUG] Got {len(arr) if isinstance(arr, list) else 'N/A'} pairs for {mint[:10]}...")
+    
+    if not isinstance(arr,list) or not arr: 
+        log.warning(f"[DEBUG] No pairs found for {mint[:10]}...")
+        return None
+    
     best=None; key=None
     for p in arr:
         liq = float((p.get("liquidity") or {}).get("usd",0) or 0)
         created = float(p.get("pairCreatedAt") or 0)
         k = (liq, created)
         if best is None or k > key: best, key = p, k
+    
+    if best:
+        liq = float((best.get("liquidity") or {}).get("usd",0) or 0)
+        log.info(f"[DEBUG] Best pair for {mint[:10]}... has ${liq:,.0f} liquidity")
+    
     return best
 
 def _tokens_batch(chain, mints: List[str]) -> List[dict]:
@@ -329,29 +377,53 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     try:
-        for r in _discover_search_new(CHAIN_ID):
-            mint, pair, created = _normalize_row_to_token(r)
-            if pair: mirror_upsert_pair(pair, CHAIN_ID, created, r)
-            if mint: mirror_upsert_token(mint, pair, created, r)
-
-        for r in _discover_search_all(CHAIN_ID):
-            mint, pair, created = _normalize_row_to_token(r)
-            if pair: mirror_upsert_pair(pair, CHAIN_ID, created, r)
-            if mint: mirror_upsert_token(mint, pair, created, r)
-
+        log.info("=" * 60)
+        log.info("[Ingester] Starting cycle - Token Profiles API ONLY (new tokens with profiles)")
+        log.info("=" * 60)
+        
+        # ONLY use profiles API - focuses on new tokens with updated profiles
         mints = _discover_profiles_latest(CHAIN_ID)
-        for mint in mints[:60]:
+        log.info(f"[Ingester] ✓ Profiles API returned {len(mints)} {CHAIN_ID} tokens")
+        
+        if len(mints) == 0:
+            log.warning("[Ingester] ⚠️ No new token profiles right now")
+            return
+        
+        processed = 0
+        failed = 0
+        
+        for i, mint in enumerate(mints):
+            # Get best pool for this token
             best = _best_pool_for_mint(CHAIN_ID, mint)
             if best:
                 mint_b, pair_b, created_b = _normalize_row_to_token(best)
-                if pair_b: mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
-                if mint_b: mirror_upsert_token(mint_b, pair_b, created_b, best)
+                
+                # Extract key stats
+                base = best.get("baseToken") or {}
+                name = base.get("symbol") or base.get("name") or "Unknown"
+                liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
+                vol24 = float((best.get("volume") or {}).get("h24", 0) or 0)
+                fdv = best.get("fdv")
+                mcap = float(fdv if fdv is not None else (best.get("marketCap") or 0) or 0)
+                age = _pair_age_minutes(time.time()*1000.0, best.get("pairCreatedAt"))
+                
+                if pair_b: 
+                    mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
+                if mint_b: 
+                    mirror_upsert_token(mint_b, pair_b, created_b, best)
+                
+                log.info(f"[Ingester] upsert {mint_b[:12]}.. liq=${liq:,.0f} vol=${vol24:,.0f} mcap=${mcap:,.0f} age={age:.0f}m")
+                processed += 1
+            else:
+                failed += 1
 
         _mirror_save(MIRROR)
         s = mirror_stats()
-        log.info(f"[ingester] mirror stats: tokens={s['tokens']} pairs={s['pairs']}")
+        log.info("=" * 60)
+        log.info(f"[Ingester] ✅ Complete! Processed: {processed}/{len(mints)} | Mirror: {s['tokens']} tokens, {s['pairs']} pairs")
+        log.info("=" * 60)
     except Exception as e:
-        log.exception(f"[ingester] error: {e}")
+        log.exception(f"[Ingester] ❌ ERROR: {e}")
 
 # -----------------------------------------------------------------------------
 # Mirror -> pairs rows
@@ -850,6 +922,77 @@ async def cmd_mirror(u: Update, c: ContextTypes.DEFAULT_TYPE):
     s = mirror_stats()
     await u.message.reply_text(json.dumps(s, indent=2))
 
+async def cmd_tokens(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Show all tokens currently in mirror with their stats"""
+    args = (u.message.text or "").split()
+    limit = 20  # Default show 20
+    
+    if len(args) >= 2:
+        try:
+            limit = min(int(args[1]), 100)  # Max 100
+        except:
+            limit = 20
+    
+    pairs = _pairs_from_mirror()
+    
+    if not pairs:
+        await u.message.reply_text("No tokens in mirror yet. Wait for ingester to run.")
+        return
+    
+    # Sort by volume (highest first)
+    pairs.sort(key=lambda x: x.get("vol24_usd", 0), reverse=True)
+    
+    # Count how many pass filters
+    passing = sum(1 for m in pairs if passes_filters_for_alert(m))
+    
+    # Take top N
+    shown = pairs[:limit]
+    
+    response = f"📊 <b>Mirror Stats</b>\n"
+    response += f"Total tokens: {len(pairs)}\n"
+    response += f"Pass filters: {passing} ✅\n"
+    response += f"Fail filters: {len(pairs) - passing} ❌\n\n"
+    response += f"<b>Top {len(shown)} tokens (by volume):</b>\n\n"
+    
+    for i, m in enumerate(shown, 1):
+        name = m.get("name", "Unknown")
+        token = m.get("token", "")
+        token_short = token[:8] + "..." if len(token) > 8 else token
+        liq = m.get("liquidity_usd", 0)
+        mcap = m.get("mcap_usd", 0)
+        vol24 = m.get("vol24_usd", 0)
+        age = m.get("age_min", 0)
+        
+        # Check which filters it passes
+        passes_liq = liq >= MIN_LIQ_USD
+        passes_mcap = mcap >= MIN_MCAP_USD if mcap > 0 else True
+        passes_vol = vol24 >= MIN_VOL_H24_USD if vol24 > 0 else True
+        passes_age = age <= MAX_AGE_MIN if age != float("inf") else True
+        passes_all = passes_liq and passes_mcap and passes_vol and passes_age
+        
+        status = "✅" if passes_all else "❌"
+        
+        response += f"{i}. {status} <b>{html_escape(name)}</b>\n"
+        response += f"   💧 Liq: ${liq:,.0f} {'✅' if passes_liq else f'❌ (need ${MIN_LIQ_USD:,.0f})'}\n"
+        
+        if not passes_mcap:
+            response += f"   📊 MCap: ${mcap:,.0f} ❌ (need ${MIN_MCAP_USD:,.0f})\n"
+        
+        if not passes_vol:
+            response += f"   📈 Vol: ${vol24:,.0f} ❌ (need ${MIN_VOL_H24_USD:,.0f})\n"
+        
+        if not passes_age and age != float("inf"):
+            response += f"   ⏰ Age: {age:.0f}m ❌ (max {MAX_AGE_MIN:.0f}m)\n"
+        
+        response += "\n"
+        
+        if len(response) > 3800:  # Telegram message limit with buffer
+            await u.message.reply_text(response, parse_mode="HTML")
+            response = ""
+    
+    if response:
+        await u.message.reply_text(response, parse_mode="HTML")
+
 # -----------------------------------------------------------------------------
 # Bot & jobs
 # -----------------------------------------------------------------------------
@@ -870,6 +1013,7 @@ application.add_handler(CommandHandler("status",     cmd_status))
 application.add_handler(CommandHandler("trade",      cmd_trade))
 application.add_handler(CommandHandler("fb",         cmd_fb))
 application.add_handler(CommandHandler("mirror",     cmd_mirror))
+application.add_handler(CommandHandler("tokens",     cmd_tokens))
 
 # -----------------------------------------------------------------------------
 # FastAPI + webhook
