@@ -377,73 +377,68 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     try:
-        log.info("=" * 60)
-        log.info("[Ingester] Starting cycle - Token Profiles API with age filtering")
-        log.info("=" * 60)
+        log.info("=" * 80)
+        log.info("[Ingester] 🎯 USING ONLY TOKEN PROFILES API")
+        log.info("[Ingester] Fetching ALL tokens with profiles (NO age filter at ingestion)")
+        log.info("=" * 80)
         
-        # ONLY use profiles API - focuses on new tokens with updated profiles
+        # ONLY use profiles API - get token addresses
         mints = _discover_profiles_latest(CHAIN_ID)
-        log.info(f"[Ingester] ✓ Profiles API returned {len(mints)} {CHAIN_ID} tokens")
+        log.info(f"[Ingester] ✅ Token Profiles API returned {len(mints)} {CHAIN_ID} token addresses")
         
         if len(mints) == 0:
-            log.warning("[Ingester] ⚠️ No new token profiles right now")
+            log.warning("[Ingester] ⚠️ No token profiles returned from API")
             return
         
         processed = 0
         failed = 0
-        skipped_old = 0
         
-        # KEY FIX: Use 2x MAX_AGE_MIN for ingestion (like BSC bot does)
-        # This allows storing tokens up to 240 minutes old in the mirror
-        # Then the alert filter (120 min) will catch the newer ones
-        max_age_for_ingestion = MAX_AGE_MIN * 2  # 240 minutes (4 hours)
-        log.info(f"[Ingester] Will store tokens up to {max_age_for_ingestion:.0f} minutes old")
+        # CRITICAL: NO AGE FILTERING HERE
+        # Store ALL tokens from profiles API, let the alert filter handle age/volume/etc
+        log.info(f"[Ingester] 📦 Processing all {len(mints)} tokens (storing ALL, no age filter)")
         
-        for i, mint in enumerate(mints):
+        for i, mint in enumerate(mints, 1):
             # Get best pool for this token
             best = _best_pool_for_mint(CHAIN_ID, mint)
+            
             if not best:
+                log.info(f"[Ingester] [{i}/{len(mints)}] ❌ No pool found for {mint[:12]}...")
                 failed += 1
-                continue
-            
-            # Calculate age BEFORE storing (critical fix!)
-            age = _pair_age_minutes(time.time()*1000.0, best.get("pairCreatedAt"))
-            
-            # Filter out tokens that are too old (like BSC bot does)
-            if age > max_age_for_ingestion:
-                log.info(f"[Ingester] Skip {mint[:12]}.. age={age:.0f}m (too old, max {max_age_for_ingestion:.0f}m)")
-                skipped_old += 1
                 continue
             
             mint_b, pair_b, created_b = _normalize_row_to_token(best)
             
-            # Extract key stats
+            # Extract stats for logging
             base = best.get("baseToken") or {}
             name = base.get("symbol") or base.get("name") or "Unknown"
             liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
             vol24 = float((best.get("volume") or {}).get("h24", 0) or 0)
             fdv = best.get("fdv")
             mcap = float(fdv if fdv is not None else (best.get("marketCap") or 0) or 0)
+            age = _pair_age_minutes(time.time()*1000.0, best.get("pairCreatedAt"))
             
+            # STORE EVERYTHING - no filtering
             if pair_b: 
                 mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
             if mint_b: 
                 mirror_upsert_token(mint_b, pair_b, created_b, best)
             
-            log.info(f"[Ingester] upsert {mint_b[:12]}.. liq=${liq:,.0f} vol=${vol24:,.0f} mcap=${mcap:,.0f} age={age:.0f}m ✅")
+            # Log with all details
+            log.info(f"[Ingester] [{i}/{len(mints)}] ✅ {name:12s} | L:${liq:>8,.0f} V:${vol24:>8,.0f} M:${mcap:>8,.0f} AGE:{age:>5.0f}m")
             processed += 1
 
         _mirror_save(MIRROR)
         s = mirror_stats()
-        log.info("=" * 60)
-        log.info(f"[Ingester] ✅ Complete!")
-        log.info(f"[Ingester] Processed: {processed}/{len(mints)} tokens")
-        log.info(f"[Ingester] Skipped (too old): {skipped_old}/{len(mints)} tokens")
-        log.info(f"[Ingester] Failed (no pool): {failed}/{len(mints)} tokens")
-        log.info(f"[Ingester] Mirror: {s['tokens']} tokens, {s['pairs']} pairs")
-        log.info("=" * 60)
+        
+        log.info("=" * 80)
+        log.info(f"[Ingester] 🎉 INGESTION COMPLETE!")
+        log.info(f"[Ingester] ✅ Stored: {processed}/{len(mints)} tokens (100% stored)")
+        log.info(f"[Ingester] ❌ Failed: {failed}/{len(mints)} tokens (no trading pair)")
+        log.info(f"[Ingester] 📊 Mirror total: {s['tokens']} tokens | {s['pairs']} pairs")
+        log.info(f"[Ingester] 🔍 Alert filters will apply: Liq≥${MIN_LIQ_USD:,.0f} | MCap≥${MIN_MCAP_USD:,.0f} | Vol≥${MIN_VOL_H24_USD:,.0f} | Age≤{MAX_AGE_MIN:.0f}m")
+        log.info("=" * 80)
     except Exception as e:
-        log.exception(f"[Ingester] ❌ ERROR: {e}")
+        log.exception(f"[Ingester] ❌ CRITICAL ERROR: {e}")
 
 # -----------------------------------------------------------------------------
 # Mirror -> pairs rows
