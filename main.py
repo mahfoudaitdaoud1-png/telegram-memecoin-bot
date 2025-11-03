@@ -378,48 +378,78 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     try:
         log.info("=" * 60)
-        log.info("[ingester] Starting ingester cycle - Using ONLY profiles API")
+        log.info("[ingester] Starting ingester cycle - Using MULTIPLE DexScreener APIs")
         log.info("=" * 60)
         
-        # ONLY use profiles API - nothing else
-        mints = _discover_profiles_latest(CHAIN_ID)
-        log.info(f"[ingester] ✓ Profiles API returned {len(mints)} {CHAIN_ID} tokens")
+        all_pairs = []
         
-        if len(mints) == 0:
-            log.warning("[ingester] ⚠️ No tokens returned from profiles API!")
+        # Strategy 1: Get new pairs from search
+        log.info("[ingester] 🔍 Fetching NEW pairs from search API...")
+        new_pairs = _discover_search_new(CHAIN_ID)
+        log.info(f"[ingester] ✓ Search NEW API returned {len(new_pairs)} pairs")
+        all_pairs.extend(new_pairs)
+        
+        # Strategy 2: Get all recent pairs
+        log.info("[ingester] 🔍 Fetching ALL recent pairs from search API...")
+        all_recent_pairs = _discover_search_all(CHAIN_ID)
+        log.info(f"[ingester] ✓ Search ALL API returned {len(all_recent_pairs)} pairs")
+        all_pairs.extend(all_recent_pairs)
+        
+        # Strategy 3: Try profiles API (may return 0)
+        log.info("[ingester] 🔍 Fetching token profiles...")
+        profile_mints = _discover_profiles_latest(CHAIN_ID)
+        log.info(f"[ingester] ✓ Profiles API returned {len(profile_mints)} tokens")
+        
+        # For profile tokens, fetch their pairs
+        if profile_mints:
+            log.info(f"[ingester] 📊 Fetching pairs for {len(profile_mints)} profile tokens...")
+            for mint in profile_mints[:50]:  # Limit to 50 to avoid too many requests
+                best = _best_pool_for_mint(CHAIN_ID, mint)
+                if best:
+                    all_pairs.append(best)
+        
+        if len(all_pairs) == 0:
+            log.warning("[ingester] ⚠️ No pairs found from ANY API!")
             log.warning("[ingester] This could mean:")
-            log.warning("[ingester]   1. No Solana tokens have profiles right now")
-            log.warning("[ingester]   2. API is rate limiting")
-            log.warning("[ingester]   3. Network issue")
+            log.warning("[ingester]   1. DexScreener API is down")
+            log.warning("[ingester]   2. Network issue")
+            log.warning("[ingester]   3. Rate limiting")
             return
+        
+        log.info(f"[ingester] 📦 Total pairs collected: {len(all_pairs)}")
         
         processed = 0
         failed = 0
         
-        for i, mint in enumerate(mints):
-            log.info(f"[ingester] Processing token {i+1}/{len(mints)}: {mint[:10]}...")
+        # Process all collected pairs
+        for i, pair_data in enumerate(all_pairs):
+            if not pair_data or not isinstance(pair_data, dict):
+                continue
+                
+            mint, pair, created = _normalize_row_to_token(pair_data)
             
-            # Get best pool for this token
-            best = _best_pool_for_mint(CHAIN_ID, mint)
-            if best:
-                mint_b, pair_b, created_b = _normalize_row_to_token(best)
-                if pair_b: 
-                    mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
-                    log.info(f"[ingester]   ✓ Added pair {pair_b[:10]}...")
-                if mint_b: 
-                    mirror_upsert_token(mint_b, pair_b, created_b, best)
-                    log.info(f"[ingester]   ✓ Added token {mint_b[:10]}...")
-                processed += 1
-            else:
-                log.warning(f"[ingester]   ✗ No pool found for {mint[:10]}...")
+            if not mint:
                 failed += 1
+                continue
+            
+            # Update mirror with this pair/token
+            if pair:
+                mirror_upsert_pair(pair, CHAIN_ID, created, pair_data)
+            if mint:
+                mirror_upsert_token(mint, pair, created, pair_data)
+            
+            processed += 1
+            
+            # Log progress every 50 pairs
+            if (i + 1) % 50 == 0:
+                log.info(f"[ingester] Progress: {i+1}/{len(all_pairs)} pairs processed...")
 
         _mirror_save(MIRROR)
         s = mirror_stats()
         log.info("=" * 60)
         log.info(f"[ingester] ✅ Ingester complete!")
-        log.info(f"[ingester] Processed: {processed}/{len(mints)} tokens")
-        log.info(f"[ingester] Failed: {failed}/{len(mints)} tokens")
+        log.info(f"[ingester] Processed: {processed}/{len(all_pairs)} pairs")
+        log.info(f"[ingester] Failed: {failed}/{len(all_pairs)} pairs")
         log.info(f"[ingester] Mirror stats: tokens={s['tokens']} pairs={s['pairs']}")
         log.info("=" * 60)
     except Exception as e:
