@@ -153,14 +153,30 @@ def _fetch_image_bytes(url: str) -> Optional[bytes]:
         return None
 
 def _logo_candidates(mint: str, image_url: Optional[str]) -> List[str]:
+    """
+    Returns logo URLs in priority order (highest quality first).
+    Telegram will display images at best quality available up to 1280px.
+    """
     cands: List[str] = []
-    if image_url: cands.append(_normalize_ipfs(image_url))
+    
+    # Priority 1: Token's official imageUrl from DexScreener (usually best quality)
+    if image_url: 
+        cands.append(_normalize_ipfs(image_url))
+    
+    # Priority 2: DexScreener CDN (reliable, good quality, 200x200 typically)
     if mint:
         cands.append(f"https://cdn.dexscreener.com/token-icons/solana/{mint}.png")
+    
+    # Priority 3: DexScreener data CDN (backup)
+    if mint:
         cands.append(f"https://dd.dexscreener.com/ds-data/tokens/solana/{mint}.png")
+    
+    # Remove duplicates while preserving order
     out=[]; seen=set()
     for u in cands:
-        if u and u not in seen: out.append(u); seen.add(u)
+        if u and u not in seen: 
+            out.append(u)
+            seen.add(u)
     return out
 
 def _normalize_handle(s: str) -> Optional[str]:
@@ -484,11 +500,23 @@ def decorate_with_first_seen(pairs):
         rec = FIRST_SEEN.get(tok)
         is_new = rec is None
         if is_new:
-            FIRST_SEEN[tok] = {"first": (cur if cur>0 else 0.0), "ts": now_ts}
+            FIRST_SEEN[tok] = {
+                "first": (cur if cur>0 else 0.0), 
+                "ts": now_ts,
+                "tw_handle": m.get("tw_handle"),  # Store Twitter handle
+                "tw_url": m.get("tw_url")          # Store Twitter URL
+            }
             changed=True
         else:
             if rec.get("first",0)==0 and cur>0:
                 rec["first"]=cur; changed=True
+            # Store Twitter info if not already stored
+            if not rec.get("tw_handle") and m.get("tw_handle"):
+                rec["tw_handle"] = m.get("tw_handle")
+                changed = True
+            if not rec.get("tw_url") and m.get("tw_url"):
+                rec["tw_url"] = m.get("tw_url")
+                changed = True
         m["is_first_time"]=is_new
         m["first_mcap_usd"]=float(FIRST_SEEN.get(tok,{}).get("first",0))
     if changed: _save_first_seen(FIRST_SEEN)
@@ -840,6 +868,12 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
             cur=_best_pool_for_mint(CHAIN_ID, token)
             if not cur: continue
             base=cur.get("baseToken") or {}; info=cur.get("info") or {}
+            
+            # Use stored Twitter info for consistency
+            stored_tw_handle = first_rec.get("tw_handle")
+            stored_tw_url = first_rec.get("tw_url")
+            fresh_tw_handle, fresh_tw_url = _extract_x(info)
+            
             m = {
                 "name": base.get("symbol") or base.get("name") or "Unknown",
                 "token": base.get("address") or token,
@@ -851,8 +885,8 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
                 "age_min": _pair_age_minutes(time.time()*1000.0, cur.get("pairCreatedAt")),
                 "url": _valid_url(cur.get("url") or ""),
                 "logo_hint": info.get("imageUrl") or base.get("logo") or "",
-                "tw_handle": _extract_x(info)[0],
-                "tw_url": _valid_url(_extract_x(info)[1]),
+                "tw_handle": stored_tw_handle or fresh_tw_handle,  # Prefer stored
+                "tw_url": _valid_url(stored_tw_url or fresh_tw_url),  # Prefer stored
                 "axiom": AXIOM_WEB_URL.format(pair=cur.get("pairAddress") or "") if cur.get("pairAddress") else "https://axiom.trade/",
                 "gmgn": GMGN_WEB_URL.format(mint=token) if token else "https://gmgn.ai/",
             }
