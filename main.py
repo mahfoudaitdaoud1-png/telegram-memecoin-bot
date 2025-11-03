@@ -377,68 +377,53 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     try:
-        log.info("=" * 80)
-        log.info("[Ingester] 🎯 USING ONLY TOKEN PROFILES API")
-        log.info("[Ingester] Fetching ALL tokens with profiles (NO age filter at ingestion)")
-        log.info("=" * 80)
+        log.info("=" * 60)
+        log.info("[Ingester] Starting cycle - Token Profiles API ONLY (new tokens with profiles)")
+        log.info("=" * 60)
         
-        # ONLY use profiles API - get token addresses
+        # ONLY use profiles API - focuses on new tokens with updated profiles
         mints = _discover_profiles_latest(CHAIN_ID)
-        log.info(f"[Ingester] ✅ Token Profiles API returned {len(mints)} {CHAIN_ID} token addresses")
+        log.info(f"[Ingester] ✓ Profiles API returned {len(mints)} {CHAIN_ID} tokens")
         
         if len(mints) == 0:
-            log.warning("[Ingester] ⚠️ No token profiles returned from API")
+            log.warning("[Ingester] ⚠️ No new token profiles right now")
             return
         
         processed = 0
         failed = 0
         
-        # CRITICAL: NO AGE FILTERING HERE
-        # Store ALL tokens from profiles API, let the alert filter handle age/volume/etc
-        log.info(f"[Ingester] 📦 Processing all {len(mints)} tokens (storing ALL, no age filter)")
-        
-        for i, mint in enumerate(mints, 1):
+        for i, mint in enumerate(mints):
             # Get best pool for this token
             best = _best_pool_for_mint(CHAIN_ID, mint)
-            
-            if not best:
-                log.info(f"[Ingester] [{i}/{len(mints)}] ❌ No pool found for {mint[:12]}...")
+            if best:
+                mint_b, pair_b, created_b = _normalize_row_to_token(best)
+                
+                # Extract key stats
+                base = best.get("baseToken") or {}
+                name = base.get("symbol") or base.get("name") or "Unknown"
+                liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
+                vol24 = float((best.get("volume") or {}).get("h24", 0) or 0)
+                fdv = best.get("fdv")
+                mcap = float(fdv if fdv is not None else (best.get("marketCap") or 0) or 0)
+                age = _pair_age_minutes(time.time()*1000.0, best.get("pairCreatedAt"))
+                
+                if pair_b: 
+                    mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
+                if mint_b: 
+                    mirror_upsert_token(mint_b, pair_b, created_b, best)
+                
+                log.info(f"[Ingester] upsert {mint_b[:12]}.. liq=${liq:,.0f} vol=${vol24:,.0f} mcap=${mcap:,.0f} age={age:.0f}m")
+                processed += 1
+            else:
                 failed += 1
-                continue
-            
-            mint_b, pair_b, created_b = _normalize_row_to_token(best)
-            
-            # Extract stats for logging
-            base = best.get("baseToken") or {}
-            name = base.get("symbol") or base.get("name") or "Unknown"
-            liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
-            vol24 = float((best.get("volume") or {}).get("h24", 0) or 0)
-            fdv = best.get("fdv")
-            mcap = float(fdv if fdv is not None else (best.get("marketCap") or 0) or 0)
-            age = _pair_age_minutes(time.time()*1000.0, best.get("pairCreatedAt"))
-            
-            # STORE EVERYTHING - no filtering
-            if pair_b: 
-                mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
-            if mint_b: 
-                mirror_upsert_token(mint_b, pair_b, created_b, best)
-            
-            # Log with all details
-            log.info(f"[Ingester] [{i}/{len(mints)}] ✅ {name:12s} | L:${liq:>8,.0f} V:${vol24:>8,.0f} M:${mcap:>8,.0f} AGE:{age:>5.0f}m")
-            processed += 1
 
         _mirror_save(MIRROR)
         s = mirror_stats()
-        
-        log.info("=" * 80)
-        log.info(f"[Ingester] 🎉 INGESTION COMPLETE!")
-        log.info(f"[Ingester] ✅ Stored: {processed}/{len(mints)} tokens (100% stored)")
-        log.info(f"[Ingester] ❌ Failed: {failed}/{len(mints)} tokens (no trading pair)")
-        log.info(f"[Ingester] 📊 Mirror total: {s['tokens']} tokens | {s['pairs']} pairs")
-        log.info(f"[Ingester] 🔍 Alert filters will apply: Liq≥${MIN_LIQ_USD:,.0f} | MCap≥${MIN_MCAP_USD:,.0f} | Vol≥${MIN_VOL_H24_USD:,.0f} | Age≤{MAX_AGE_MIN:.0f}m")
-        log.info("=" * 80)
+        log.info("=" * 60)
+        log.info(f"[Ingester] ✅ Complete! Processed: {processed}/{len(mints)} | Mirror: {s['tokens']} tokens, {s['pairs']} pairs")
+        log.info("=" * 60)
     except Exception as e:
-        log.exception(f"[Ingester] ❌ CRITICAL ERROR: {e}")
+        log.exception(f"[Ingester] ❌ ERROR: {e}")
 
 # -----------------------------------------------------------------------------
 # Mirror -> pairs rows
@@ -839,14 +824,27 @@ async def do_trade_push(bot):
     except Exception as e:
         log.exception(f"do_trade_push error: {e}")
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
-    log.info(f"🔥 [tick] auto_trade fired (interval={TRADE_SUMMARY_SEC}s)")
-    await do_trade_push(context.bot)
-async def updater(context: ContextTypes.DEFAULT_TYPE):
-    log.info(f"🧊 [tick] updater fired (interval={UPDATE_INTERVAL_SEC}s)")
     try:
-        if not TRACKED: return
+        log.info(f"🔥 [auto_trade] FIRED! (interval={TRADE_SUMMARY_SEC}s, subs={len(SUBS)})")
+        if len(SUBS) == 0:
+            log.warning("[auto_trade] NO SUBSCRIBERS - skipping")
+            return
+        await do_trade_push(context.bot)
+        log.info(f"🔥 [auto_trade] Complete")
+    except Exception as e:
+        log.exception(f"[auto_trade] ERROR: {e}")
+
+async def updater(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        log.info(f"🧊 [updater] FIRED! (interval={UPDATE_INTERVAL_SEC}s, tracked={len(TRACKED)}, subs={len(SUBS)})")
+        if len(SUBS) == 0:
+            log.warning("[updater] NO SUBSCRIBERS - skipping")
+            return
+        if not TRACKED: 
+            log.info("[updater] No tracked tokens yet - skipping")
+            return
         now_ts=int(time.time())
-        log.info(f"[updater] refreshing {len(TRACKED)} tracked tokens")
+        log.info(f"[updater] Refreshing {len(TRACKED)} tracked tokens")
         for token in list(TRACKED):
             first_rec = FIRST_SEEN.get(token) or {}
             first_ts = int(first_rec.get("ts", now_ts))
@@ -879,8 +877,9 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
                 if passes_filters_for_alert(m):
                     await send_price_update(context.bot, chat_id, m)
                     await asyncio.sleep(0.02)
+        log.info(f"🧊 [updater] Complete")
     except Exception as e:
-        log.exception(f"updater job error: {e}")
+        log.exception(f"[updater] ERROR: {e}")
 
 # -----------------------------------------------------------------------------
 # Commands
@@ -1054,15 +1053,35 @@ async def _startup():
 
 async def _start_bot_and_jobs():
     try:
+        log.info("=" * 80)
+        log.info("[STARTUP] Initializing application...")
         await application.initialize()
+        
         jq = application.job_queue
+        log.info(f"[STARTUP] Job queue: {jq}")
+        
+        log.info(f"[STARTUP] Registering ingester job (every {INGEST_INTERVAL_SEC}s)...")
         jq.run_repeating(ingester, interval=timedelta(seconds=INGEST_INTERVAL_SEC), first=timedelta(seconds=2), name="ingester")
+        
+        log.info(f"[STARTUP] Registering auto_trade job (every {TRADE_SUMMARY_SEC}s)...")
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
+        
+        log.info(f"[STARTUP] Registering updater job (every {UPDATE_INTERVAL_SEC}s)...")
         jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
+        
+        log.info("[STARTUP] Starting application...")
         await application.start()
-        log.info("Bot initialized & started")
+        
+        log.info("=" * 80)
+        log.info("[STARTUP] ✅ Bot initialized & started successfully!")
+        log.info(f"[STARTUP] Subscribers: {len(SUBS)} | ALERT_CHAT_ID: {ALERT_CHAT_ID}")
+        log.info(f"[STARTUP] Jobs registered:")
+        log.info(f"  - ingester: every {INGEST_INTERVAL_SEC}s")
+        log.info(f"  - auto_trade: every {TRADE_SUMMARY_SEC}s")  
+        log.info(f"  - updater: every {UPDATE_INTERVAL_SEC}s")
+        log.info("=" * 80)
     except Exception as e:
-        log.exception("Bot startup failed: %r", e)
+        log.exception("❌ [STARTUP] Bot startup FAILED: %r", e)
 
 @app.on_event("shutdown")
 async def _shutdown():
