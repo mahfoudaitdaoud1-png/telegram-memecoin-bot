@@ -964,6 +964,12 @@ async def _post_init(app: Application):
     log.info(f"Subscribers: {sorted(SUBS)}")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
+
+# Ensure job_queue is initialized
+if not application.job_queue:
+    from telegram.ext import JobQueue
+    application.job_queue = JobQueue()
+    application.job_queue.set_application(application)
 application.add_handler(CommandHandler("start",      cmd_start))
 application.add_handler(CommandHandler("id",         cmd_id))
 application.add_handler(CommandHandler("subscribe",  cmd_sub))
@@ -998,12 +1004,19 @@ async def _startup():
 async def _start_bot_and_jobs():
     try:
         await application.initialize()
+        await application.start()
+        
         jq = application.job_queue
+        if jq is None:
+            log.error("Job queue is None! Cannot schedule jobs.")
+            log.error("This usually means the bot wasn't built with job_queue support.")
+            return
+            
         jq.run_repeating(ingester, interval=timedelta(seconds=INGEST_INTERVAL_SEC), first=timedelta(seconds=2), name="ingester")
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
         jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
-        await application.start()
-        log.info("Bot initialized & started")
+        
+        log.info("Bot initialized & started with job queue")
     except Exception as e:
         log.exception("Bot startup failed: %r", e)
 
