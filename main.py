@@ -378,82 +378,52 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     try:
         log.info("=" * 60)
-        log.info("[ingester] Starting ingester cycle - Using MULTIPLE DexScreener APIs")
+        log.info("[Ingester] Starting cycle - Token Profiles API ONLY (new tokens with profiles)")
         log.info("=" * 60)
         
-        all_pairs = []
+        # ONLY use profiles API - focuses on new tokens with updated profiles
+        mints = _discover_profiles_latest(CHAIN_ID)
+        log.info(f"[Ingester] ✓ Profiles API returned {len(mints)} {CHAIN_ID} tokens")
         
-        # Strategy 1: Get new pairs from search
-        log.info("[ingester] 🔍 Fetching NEW pairs from search API...")
-        new_pairs = _discover_search_new(CHAIN_ID)
-        log.info(f"[ingester] ✓ Search NEW API returned {len(new_pairs)} pairs")
-        all_pairs.extend(new_pairs)
-        
-        # Strategy 2: Get all recent pairs
-        log.info("[ingester] 🔍 Fetching ALL recent pairs from search API...")
-        all_recent_pairs = _discover_search_all(CHAIN_ID)
-        log.info(f"[ingester] ✓ Search ALL API returned {len(all_recent_pairs)} pairs")
-        all_pairs.extend(all_recent_pairs)
-        
-        # Strategy 3: Try profiles API (may return 0)
-        log.info("[ingester] 🔍 Fetching token profiles...")
-        profile_mints = _discover_profiles_latest(CHAIN_ID)
-        log.info(f"[ingester] ✓ Profiles API returned {len(profile_mints)} tokens")
-        
-        # For profile tokens, fetch their pairs
-        if profile_mints:
-            log.info(f"[ingester] 📊 Fetching pairs for {len(profile_mints)} profile tokens...")
-            for mint in profile_mints[:50]:  # Limit to 50 to avoid too many requests
-                best = _best_pool_for_mint(CHAIN_ID, mint)
-                if best:
-                    all_pairs.append(best)
-        
-        if len(all_pairs) == 0:
-            log.warning("[ingester] ⚠️ No pairs found from ANY API!")
-            log.warning("[ingester] This could mean:")
-            log.warning("[ingester]   1. DexScreener API is down")
-            log.warning("[ingester]   2. Network issue")
-            log.warning("[ingester]   3. Rate limiting")
+        if len(mints) == 0:
+            log.warning("[Ingester] ⚠️ No new token profiles right now")
             return
-        
-        log.info(f"[ingester] 📦 Total pairs collected: {len(all_pairs)}")
         
         processed = 0
         failed = 0
         
-        # Process all collected pairs
-        for i, pair_data in enumerate(all_pairs):
-            if not pair_data or not isinstance(pair_data, dict):
-                continue
+        for i, mint in enumerate(mints):
+            # Get best pool for this token
+            best = _best_pool_for_mint(CHAIN_ID, mint)
+            if best:
+                mint_b, pair_b, created_b = _normalize_row_to_token(best)
                 
-            mint, pair, created = _normalize_row_to_token(pair_data)
-            
-            if not mint:
+                # Extract key stats
+                base = best.get("baseToken") or {}
+                name = base.get("symbol") or base.get("name") or "Unknown"
+                liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
+                vol24 = float((best.get("volume") or {}).get("h24", 0) or 0)
+                fdv = best.get("fdv")
+                mcap = float(fdv if fdv is not None else (best.get("marketCap") or 0) or 0)
+                age = _pair_age_minutes(time.time()*1000.0, best.get("pairCreatedAt"))
+                
+                if pair_b: 
+                    mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
+                if mint_b: 
+                    mirror_upsert_token(mint_b, pair_b, created_b, best)
+                
+                log.info(f"[Ingester] upsert {mint_b[:12]}.. liq=${liq:,.0f} vol=${vol24:,.0f} mcap=${mcap:,.0f} age={age:.0f}m")
+                processed += 1
+            else:
                 failed += 1
-                continue
-            
-            # Update mirror with this pair/token
-            if pair:
-                mirror_upsert_pair(pair, CHAIN_ID, created, pair_data)
-            if mint:
-                mirror_upsert_token(mint, pair, created, pair_data)
-            
-            processed += 1
-            
-            # Log progress every 50 pairs
-            if (i + 1) % 50 == 0:
-                log.info(f"[ingester] Progress: {i+1}/{len(all_pairs)} pairs processed...")
 
         _mirror_save(MIRROR)
         s = mirror_stats()
         log.info("=" * 60)
-        log.info(f"[ingester] ✅ Ingester complete!")
-        log.info(f"[ingester] Processed: {processed}/{len(all_pairs)} pairs")
-        log.info(f"[ingester] Failed: {failed}/{len(all_pairs)} pairs")
-        log.info(f"[ingester] Mirror stats: tokens={s['tokens']} pairs={s['pairs']}")
+        log.info(f"[Ingester] ✅ Complete! Processed: {processed}/{len(mints)} | Mirror: {s['tokens']} tokens, {s['pairs']} pairs")
         log.info("=" * 60)
     except Exception as e:
-        log.exception(f"[ingester] ❌ ERROR: {e}")
+        log.exception(f"[Ingester] ❌ ERROR: {e}")
 
 # -----------------------------------------------------------------------------
 # Mirror -> pairs rows
@@ -952,6 +922,77 @@ async def cmd_mirror(u: Update, c: ContextTypes.DEFAULT_TYPE):
     s = mirror_stats()
     await u.message.reply_text(json.dumps(s, indent=2))
 
+async def cmd_tokens(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Show all tokens currently in mirror with their stats"""
+    args = (u.message.text or "").split()
+    limit = 20  # Default show 20
+    
+    if len(args) >= 2:
+        try:
+            limit = min(int(args[1]), 100)  # Max 100
+        except:
+            limit = 20
+    
+    pairs = _pairs_from_mirror()
+    
+    if not pairs:
+        await u.message.reply_text("No tokens in mirror yet. Wait for ingester to run.")
+        return
+    
+    # Sort by volume (highest first)
+    pairs.sort(key=lambda x: x.get("vol24_usd", 0), reverse=True)
+    
+    # Count how many pass filters
+    passing = sum(1 for m in pairs if passes_filters_for_alert(m))
+    
+    # Take top N
+    shown = pairs[:limit]
+    
+    response = f"📊 <b>Mirror Stats</b>\n"
+    response += f"Total tokens: {len(pairs)}\n"
+    response += f"Pass filters: {passing} ✅\n"
+    response += f"Fail filters: {len(pairs) - passing} ❌\n\n"
+    response += f"<b>Top {len(shown)} tokens (by volume):</b>\n\n"
+    
+    for i, m in enumerate(shown, 1):
+        name = m.get("name", "Unknown")
+        token = m.get("token", "")
+        token_short = token[:8] + "..." if len(token) > 8 else token
+        liq = m.get("liquidity_usd", 0)
+        mcap = m.get("mcap_usd", 0)
+        vol24 = m.get("vol24_usd", 0)
+        age = m.get("age_min", 0)
+        
+        # Check which filters it passes
+        passes_liq = liq >= MIN_LIQ_USD
+        passes_mcap = mcap >= MIN_MCAP_USD if mcap > 0 else True
+        passes_vol = vol24 >= MIN_VOL_H24_USD if vol24 > 0 else True
+        passes_age = age <= MAX_AGE_MIN if age != float("inf") else True
+        passes_all = passes_liq and passes_mcap and passes_vol and passes_age
+        
+        status = "✅" if passes_all else "❌"
+        
+        response += f"{i}. {status} <b>{html_escape(name)}</b>\n"
+        response += f"   💧 Liq: ${liq:,.0f} {'✅' if passes_liq else f'❌ (need ${MIN_LIQ_USD:,.0f})'}\n"
+        
+        if not passes_mcap:
+            response += f"   📊 MCap: ${mcap:,.0f} ❌ (need ${MIN_MCAP_USD:,.0f})\n"
+        
+        if not passes_vol:
+            response += f"   📈 Vol: ${vol24:,.0f} ❌ (need ${MIN_VOL_H24_USD:,.0f})\n"
+        
+        if not passes_age and age != float("inf"):
+            response += f"   ⏰ Age: {age:.0f}m ❌ (max {MAX_AGE_MIN:.0f}m)\n"
+        
+        response += "\n"
+        
+        if len(response) > 3800:  # Telegram message limit with buffer
+            await u.message.reply_text(response, parse_mode="HTML")
+            response = ""
+    
+    if response:
+        await u.message.reply_text(response, parse_mode="HTML")
+
 # -----------------------------------------------------------------------------
 # Bot & jobs
 # -----------------------------------------------------------------------------
@@ -964,12 +1005,6 @@ async def _post_init(app: Application):
     log.info(f"Subscribers: {sorted(SUBS)}")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
-
-# Ensure job_queue is initialized
-if not application.job_queue:
-    from telegram.ext import JobQueue
-    application.job_queue = JobQueue()
-    application.job_queue.set_application(application)
 application.add_handler(CommandHandler("start",      cmd_start))
 application.add_handler(CommandHandler("id",         cmd_id))
 application.add_handler(CommandHandler("subscribe",  cmd_sub))
@@ -978,6 +1013,7 @@ application.add_handler(CommandHandler("status",     cmd_status))
 application.add_handler(CommandHandler("trade",      cmd_trade))
 application.add_handler(CommandHandler("fb",         cmd_fb))
 application.add_handler(CommandHandler("mirror",     cmd_mirror))
+application.add_handler(CommandHandler("tokens",     cmd_tokens))
 
 # -----------------------------------------------------------------------------
 # FastAPI + webhook
@@ -1004,19 +1040,12 @@ async def _startup():
 async def _start_bot_and_jobs():
     try:
         await application.initialize()
-        await application.start()
-        
         jq = application.job_queue
-        if jq is None:
-            log.error("Job queue is None! Cannot schedule jobs.")
-            log.error("This usually means the bot wasn't built with job_queue support.")
-            return
-            
         jq.run_repeating(ingester, interval=timedelta(seconds=INGEST_INTERVAL_SEC), first=timedelta(seconds=2), name="ingester")
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
         jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
-        
-        log.info("Bot initialized & started with job queue")
+        await application.start()
+        log.info("Bot initialized & started")
     except Exception as e:
         log.exception("Bot startup failed: %r", e)
 
