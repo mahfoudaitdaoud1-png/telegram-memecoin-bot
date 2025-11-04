@@ -303,7 +303,8 @@ def _discover_search_all(chain=CHAIN_ID) -> List[dict]:
     j = _get_json(SEARCH_ALL_URL.format(chain=chain), timeout=15) or {}
     return j.get("pairs",[]) if isinstance(j,dict) else []
 
-def _discover_profiles_latest(chain=CHAIN_ID) -> List[str]:
+def _discover_profiles_latest(chain=CHAIN_ID) -> List[dict]:
+    """Fetch latest token profiles which include social links and metadata"""
     log.info(f"[DEBUG] Calling profiles API: {TOKEN_PROFILES_URL}")
     arr = _get_json(TOKEN_PROFILES_URL, timeout=15) or []
     log.info(f"[DEBUG] Profiles API response type: {type(arr)}")
@@ -313,12 +314,12 @@ def _discover_profiles_latest(chain=CHAIN_ID) -> List[str]:
         # Show first item as example
         log.info(f"[DEBUG] First item sample: {json.dumps(arr[0], indent=2)[:300]}")
     
-    # Filter for our chain
-    result = [x.get("tokenAddress") for x in arr if isinstance(x,dict) and (x.get("chainId") or "").lower()==chain]
-    log.info(f"[DEBUG] After filtering for chain '{chain}': {len(result)} tokens")
+    # Filter for our chain and return full profile objects (not just addresses)
+    result = [x for x in arr if isinstance(x,dict) and (x.get("chainId") or "").lower()==chain]
+    log.info(f"[DEBUG] After filtering for chain '{chain}': {len(result)} token profiles")
     
     if len(result) > 0:
-        log.info(f"[DEBUG] First 3 token addresses: {result[:3]}")
+        log.info(f"[DEBUG] First 3 token addresses: {[x.get('tokenAddress') for x in result[:3]]}")
     
     return result
 
@@ -410,22 +411,41 @@ async def ingester(context: ContextTypes.DEFAULT_TYPE):
         log.info("[Ingester] Starting cycle - Token Profiles API ONLY (new tokens with profiles)")
         log.info("=" * 60)
         
-        # ONLY use profiles API - focuses on new tokens with updated profiles
-        mints = _discover_profiles_latest(CHAIN_ID)
-        log.info(f"[Ingester] ✓ Profiles API returned {len(mints)} {CHAIN_ID} tokens")
+        # Get token profiles which include social links and metadata
+        profiles = _discover_profiles_latest(CHAIN_ID)
+        log.info(f"[Ingester] ✓ Profiles API returned {len(profiles)} {CHAIN_ID} token profiles")
         
-        if len(mints) == 0:
+        if len(profiles) == 0:
             log.warning("[Ingester] ⚠️ No new token profiles right now")
             return
         
         processed = 0
         failed = 0
         
-        for i, mint in enumerate(mints):
+        for i, profile in enumerate(profiles):
+            mint = profile.get("tokenAddress")
+            if not mint:
+                continue
+                
             # Get best pool for this token
             best = _best_pool_for_mint(CHAIN_ID, mint)
             if best:
                 mint_b, pair_b, created_b = _normalize_row_to_token(best)
+                
+                # CRITICAL: Merge profile data (links, description, etc.) into pair data
+                # The profile contains: url, chainId, tokenAddress, icon, header, description, links[]
+                if "links" in profile and profile["links"]:
+                    # Create info object with links in the format expected by _extract_x
+                    if "info" not in best:
+                        best["info"] = {}
+                    best["info"]["links"] = profile["links"]
+                    log.info(f"[Ingester] ✓ Merged {len(profile['links'])} social links for {mint[:12]}...")
+                
+                # Also merge icon/image if available
+                if "icon" in profile and profile["icon"]:
+                    if "info" not in best:
+                        best["info"] = {}
+                    best["info"]["imageUrl"] = profile["icon"]
                 
                 # Extract key stats
                 base = best.get("baseToken") or {}
@@ -449,7 +469,7 @@ async def ingester(context: ContextTypes.DEFAULT_TYPE):
         _mirror_save(MIRROR)
         s = mirror_stats()
         log.info("=" * 60)
-        log.info(f"[Ingester] ✅ Complete! Processed: {processed}/{len(mints)} | Mirror: {s['tokens']} tokens, {s['pairs']} pairs")
+        log.info(f"[Ingester] ✅ Complete! Processed: {processed}/{len(profiles)} | Mirror: {s['tokens']} tokens, {s['pairs']} pairs")
         log.info("=" * 60)
     except Exception as e:
         log.exception(f"[Ingester] ❌ ERROR: {e}")
