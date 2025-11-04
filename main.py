@@ -912,10 +912,18 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
             if not cur: continue
             base=cur.get("baseToken") or {}; info=cur.get("info") or {}
             
-            # Use stored Twitter info for consistency
+            # Use stored Twitter info for consistency (profile links won't be in fresh pair data)
             stored_tw_handle = first_rec.get("tw_handle")
             stored_tw_url = first_rec.get("tw_url")
             fresh_tw_handle, fresh_tw_url = _extract_x(info)
+            
+            # Prefer stored values since profile data isn't refreshed on updates
+            final_tw_handle = stored_tw_handle or fresh_tw_handle
+            final_tw_url = stored_tw_url or fresh_tw_url
+            if not final_tw_url and final_tw_handle:
+                final_tw_url = X_USER_URL.format(handle=final_tw_handle)
+            if not final_tw_url:
+                final_tw_url = "https://x.com/"
             
             m = {
                 "name": base.get("symbol") or base.get("name") or "Unknown",
@@ -928,8 +936,8 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
                 "age_min": _pair_age_minutes(time.time()*1000.0, cur.get("pairCreatedAt")),
                 "url": _valid_url(cur.get("url") or ""),
                 "logo_hint": info.get("imageUrl") or base.get("logo") or "",
-                "tw_handle": stored_tw_handle or fresh_tw_handle,  # Prefer stored
-                "tw_url": _valid_url(stored_tw_url or fresh_tw_url),  # Prefer stored
+                "tw_handle": final_tw_handle,
+                "tw_url": final_tw_url,  # Use the URL directly, don't re-validate
                 "axiom": AXIOM_WEB_URL.format(pair=cur.get("pairAddress") or "") if cur.get("pairAddress") else "https://axiom.trade/",
                 "gmgn": GMGN_WEB_URL.format(mint=token) if token else "https://gmgn.ai/",
             }
