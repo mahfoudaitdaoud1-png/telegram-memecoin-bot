@@ -1078,6 +1078,36 @@ async def cmd_tokens(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if response:
         await u.message.reply_text(response, parse_mode="HTML")
 
+async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Reset bot memory - makes all tokens new again (🔥)"""
+    global FIRST_SEEN, TRACKED, LAST_PINNED
+    
+    # Backup current data
+    backup_data = {
+        "first_seen_count": len(FIRST_SEEN),
+        "tracked_count": len(TRACKED),
+        "timestamp": int(time.time())
+    }
+    
+    # Clear in-memory data
+    FIRST_SEEN.clear()
+    TRACKED.clear()
+    LAST_PINNED.clear()
+    
+    # Save empty first_seen to disk
+    _save_first_seen(FIRST_SEEN)
+    
+    await u.message.reply_text(
+        f"🔥 <b>Bot Memory Reset!</b>\n\n"
+        f"Cleared:\n"
+        f"  • {backup_data['first_seen_count']} tokens from first-seen\n"
+        f"  • {backup_data['tracked_count']} tracked tokens\n"
+        f"  • All pinned message tracking\n\n"
+        f"All tokens will now be treated as NEW and get 🔥 fire emoji!\n\n"
+        f"Note: Mirror cache preserved. Use /mirror to see current state.",
+        parse_mode="HTML"
+    )
+
 # -----------------------------------------------------------------------------
 # Bot & jobs
 # -----------------------------------------------------------------------------
@@ -1099,6 +1129,7 @@ application.add_handler(CommandHandler("trade",      cmd_trade))
 application.add_handler(CommandHandler("fb",         cmd_fb))
 application.add_handler(CommandHandler("mirror",     cmd_mirror))
 application.add_handler(CommandHandler("tokens",     cmd_tokens))
+application.add_handler(CommandHandler("reset",      cmd_reset))
 
 # -----------------------------------------------------------------------------
 # FastAPI + webhook
