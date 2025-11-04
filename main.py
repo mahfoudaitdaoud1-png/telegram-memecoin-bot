@@ -474,11 +474,20 @@ def _pairs_from_mirror() -> List[dict]:
         url   = _valid_url(row.get("url") or (DEXSCREENER_PAIR_URL.format(pair=pair) if pair else ""))
         age_m = _pair_age_minutes(now_ms, row.get("pairCreatedAt"))
         x_handle, x_url = _extract_x(info)
+        # Build tw_url: prioritize the extracted URL (which could be a community link or profile), 
+        # otherwise construct from handle, otherwise default to x.com homepage
+        if x_url:
+            tw_url_final = _valid_url(x_url)
+        elif x_handle:
+            tw_url_final = X_USER_URL.format(handle=x_handle)
+        else:
+            tw_url_final = "https://x.com/"
+        
         rows.append({
             "name": name, "token": token, "pair": pair, "price_usd": price,
             "liquidity_usd": liq, "mcap_usd": mcap, "vol24_usd": vol24, "age_min": age_m,
             "url": url, "logo_hint": info.get("imageUrl") or base.get("logo") or "",
-            "tw_url": _valid_url(x_url) or (X_USER_URL.format(handle=x_handle) if x_handle else "https://x.com/"),
+            "tw_url": tw_url_final,
             "tw_handle": x_handle,
             "axiom": AXIOM_WEB_URL.format(pair=pair) if pair else "https://axiom.trade/",
             "gmgn": GMGN_WEB_URL.format(mint=token) if token else "https://gmgn.ai/",
