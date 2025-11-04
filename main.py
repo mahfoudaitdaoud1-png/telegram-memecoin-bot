@@ -474,10 +474,11 @@ def _pairs_from_mirror() -> List[dict]:
         url   = _valid_url(row.get("url") or (DEXSCREENER_PAIR_URL.format(pair=pair) if pair else ""))
         age_m = _pair_age_minutes(now_ms, row.get("pairCreatedAt"))
         x_handle, x_url = _extract_x(info)
-        # Build tw_url: prioritize the extracted URL (which could be a community link or profile), 
-        # otherwise construct from handle, otherwise default to x.com homepage
+        
+        # Fix: use x_url directly - it already contains the full URL (community or profile)
+        # from _extract_x which properly handles both cases
         if x_url:
-            tw_url_final = _valid_url(x_url)
+            tw_url_final = x_url
         elif x_handle:
             tw_url_final = X_USER_URL.format(handle=x_handle)
         else:
