@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-This file is generated as a full-length (>1000 lines) main.py implementing:
+Memecoin Detection Bot with Integrated Twitter Scraper
 - Dexscreener mirror-style ingester
 - Telegram bot (python-telegram-bot v20)
 - FastAPI webhook
-- Separation of detection (ingester) vs alerting (filters)
+- Automatic Twitter scraping with separate visible messages
+- Results stored and shown in price updates
+- Manual /scrape command for testing
 """
 
 from __future__ import annotations
 
 import os, sys, re, json, time, asyncio, logging, pathlib
-from datetime import timedelta
+from datetime import timedelta, datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
+from collections import defaultdict
 
 import requests
 import pandas as pd
@@ -43,7 +46,7 @@ ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID", "0"))
 TRADE_SUMMARY_SEC       = int(os.getenv("TRADE_SUMMARY_SEC", "5"))
 UPDATE_INTERVAL_SEC     = int(os.getenv("UPDATE_INTERVAL_SEC", "90"))
 UPDATE_MAX_DURATION_MIN = int(os.getenv("UPDATE_MAX_DURATION_MIN", "60"))
-INGEST_INTERVAL_SEC     = int(os.getenv("INGEST_INTERVAL_SEC", "12"))  # NEW
+INGEST_INTERVAL_SEC     = int(os.getenv("INGEST_INTERVAL_SEC", "12"))
 
 DEBUG_FB = os.getenv("DEBUG_FB", "0") == "1"
 
@@ -52,6 +55,12 @@ MIN_MCAP_USD    = float(os.getenv("MIN_MCAP_USD",    "70000"))
 MIN_VOL_H24_USD = float(os.getenv("MIN_VOL_H24_USD", "40000"))
 MAX_AGE_MIN     = float(os.getenv("MAX_AGE_MIN",     "120"))
 CHAIN_ID        = os.getenv("CHAIN_ID", "solana").lower()
+
+# Twitter Scraper Config
+TWITTER_SCRAPER_ENABLED = os.getenv("TWITTER_SCRAPER_ENABLED", "1") == "1"
+TWITTER_SCRAPE_TIMEOUT = int(os.getenv("TWITTER_SCRAPE_TIMEOUT", "60"))
+TWITTER_MAX_USERNAMES = int(os.getenv("TWITTER_MAX_USERNAMES", "200"))
+TWITTER_CACHE_JSON = os.getenv("TWITTER_CACHE_JSON", "/tmp/telegram-bot/twitter_cache.json")
 
 AXIOM_WEB_URL = os.getenv("AXIOM_WEB_URL") or os.getenv("AXIOME_WEB_URL") or "https://axiom.trade/meme/{pair}"
 GMGN_WEB_URL  = os.getenv("GMGN_WEB_URL", "https://gmgn.ai/sol/token/{mint}")
@@ -73,7 +82,7 @@ FOLLOWERS_CACHE_DIR = pathlib.Path(_p("FOLLOWERS_CACHE_DIR", "/tmp/telegram-bot/
 FB_STATIC_DIR       = pathlib.Path(_p("FB_STATIC_DIR",       "/tmp/telegram-bot/followers_static"))
 MIRROR_JSON         = _p("MIRROR_JSON", "/tmp/telegram-bot/mirror.json")
 
-for d in [pathlib.Path(SUBS_FILE).parent, pathlib.Path(FIRST_SEEN_FILE).parent, FOLLOWERS_CACHE_DIR, FB_STATIC_DIR, pathlib.Path(MIRROR_JSON).parent]:
+for d in [pathlib.Path(SUBS_FILE).parent, pathlib.Path(FIRST_SEEN_FILE).parent, FOLLOWERS_CACHE_DIR, FB_STATIC_DIR, pathlib.Path(MIRROR_JSON).parent, pathlib.Path(TWITTER_CACHE_JSON).parent]:
     d.mkdir(parents=True, exist_ok=True)
 
 TW_BEARER = os.getenv("TW_BEARER", "").strip()
@@ -81,6 +90,243 @@ TW_BEARER = os.getenv("TW_BEARER", "").strip()
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": f"tg-memebot/trade-{TRADE_SUMMARY_SEC}s", "Accept": "*/*"})
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# Reader services for bypassing IP blocks
+READER_SERVICES = [
+    {"name": "Jina", "url": "https://r.jina.ai/", "prefix": True},
+    {"name": "Txtify", "url": "https://txtify.it/", "prefix": True},
+    {"name": "12ft", "url": "https://12ft.io/", "prefix": True},
+]
+
+# Global set to keep task references (prevent garbage collection)
+BACKGROUND_TASKS: Set[asyncio.Task] = set()
+
+# ====================================================================================
+# TWITTER SCRAPER CLASSES
+# ====================================================================================
+
+class TwitterPatternMatcher:
+    def __init__(self):
+        self.username_patterns = [
+            re.compile(r'@([A-Za-z0-9_]{1,15})\b'),
+            re.compile(r'(?:twitter|x)\.com/([A-Za-z0-9_]{1,15})(?:/|$|\?)', re.I),
+            re.compile(r'\(@([A-Za-z0-9_]+)\)\s+on\s+(?:X|Twitter)', re.I),
+            re.compile(r'Posted\s+by\s+@?([A-Za-z0-9_]+)', re.I),
+            re.compile(r'^@?([A-Za-z0-9_]+)\s*[:\-]', re.M),
+        ]
+        self.blacklist = {
+            'twitter', 'x', 'i', 'home', 'explore', 'search', 'status', 'web', 
+            'notifications', 'messages', 'settings', 'profile', 'lists', 'bookmarks',
+            'community', 'communities', 'trending', 'moments',
+            'done', 'todo', 'warning', 'error', 'success', 'info', 'alert', 'note',
+            'edit', 'delete', 'save', 'cancel', 'submit', 'send', 'reply', 'share',
+            'like', 'retweet', 'follow', 'unfollow', 'block', 'mute', 'report',
+            'title', 'name', 'email', 'password', 'username', 'user', 'admin',
+            'articles', 'article', 'post', 'posts', 'tweet', 'tweets', 'comment',
+            'comments', 'media', 'photo', 'photos', 'video', 'videos', 'image',
+            'resources', 'resource', 'help', 'support', 'about', 'contact', 'faq',
+            'terms', 'privacy', 'policy', 'copyright', 'dmca', 'legal',
+            'en', 'es', 'fr', 'de', 'it', 'pt', 'ru', 'ja', 'ko', 'zh', 'ar',
+            'today', 'yesterday', 'tomorrow', 'now', 'time', 'date', 'year',
+            'month', 'day', 'hour', 'minute', 'second',
+            'one', 'two', 'three', 'all', 'none', 'other', 'new', 'old', 'latest',
+            'api', 'url', 'link', 'https', 'http', 'www', 'com', 'net', 'org',
+        }
+    
+    def extract_usernames(self, text: str) -> Set[str]:
+        usernames = set()
+        for pattern in self.username_patterns:
+            for match in pattern.finditer(text):
+                username = match.group(1).lower()
+                if (username not in self.blacklist and 
+                    len(username) <= 15 and 
+                    len(username) >= 1 and 
+                    username.replace('_', '').isalnum()):
+                    usernames.add(username)
+        return usernames
+
+class URLVariantGenerator:
+    @staticmethod
+    def detect_type(url: str) -> str:
+        if '/i/communities/' in url:
+            return 'community'
+        elif '/i/lists/' in url:
+            return 'list'
+        path_parts = [p for p in url.split('/') if p and p not in ['https:', 'http:', '', 'x.com', 'twitter.com']]
+        if path_parts and re.match(r'^[A-Za-z0-9_]{1,15}$', path_parts[0]):
+            return 'profile'
+        return 'unknown'
+    
+    @staticmethod
+    def generate(url: str) -> List[str]:
+        url_type = URLVariantGenerator.detect_type(url)
+        variants = []
+        
+        if url_type == 'community':
+            match = re.search(r'/i/communities/(\d+)', url)
+            if match:
+                cid = match.group(1)
+                variants = [
+                    f"https://x.com/i/communities/{cid}",
+                    f"https://x.com/i/communities/{cid}?f=live",
+                    f"https://twitter.com/i/communities/{cid}",
+                ]
+        elif url_type == 'profile':
+            match = re.search(r'(?:x|twitter)\.com/([A-Za-z0-9_]+)', url, re.I)
+            if match:
+                username = match.group(1)
+                if username not in ['i', 'home', 'explore', 'search']:
+                    variants = [
+                        f"https://x.com/{username}",
+                        f"https://x.com/{username}/with_replies",
+                        f"https://twitter.com/{username}",
+                    ]
+        elif url_type == 'list':
+            match = re.search(r'/i/lists/(\d+)', url)
+            if match:
+                lid = match.group(1)
+                variants = [f"https://x.com/i/lists/{lid}", f"https://twitter.com/i/lists/{lid}"]
+        
+        if url not in variants:
+            variants.insert(0, url)
+        
+        seen = set()
+        unique = []
+        for v in variants:
+            if v not in seen:
+                seen.add(v)
+                unique.append(v)
+        return unique[:8]
+
+class TwitterScraper:
+    def __init__(self):
+        self.cache = self._load_cache()
+        self.matcher = TwitterPatternMatcher()
+        self.url_generator = URLVariantGenerator()
+        self.successful_service = None
+    
+    def _load_cache(self) -> Dict:
+        p = pathlib.Path(TWITTER_CACHE_JSON)
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+                log.info(f"[Twitter] Loaded cache: {len(data)} entries")
+                return data
+            except:
+                return {}
+        return {}
+    
+    def _save_cache(self):
+        try:
+            pathlib.Path(TWITTER_CACHE_JSON).write_text(json.dumps(self.cache, indent=2))
+        except Exception as e:
+            log.error(f"[Twitter] Cache save failed: {e}")
+    
+    def _get_cache_key(self, url: str) -> str:
+        url = url.lower()
+        if '/i/communities/' in url:
+            match = re.search(r'/i/communities/(\d+)', url)
+            if match:
+                return f"community_{match.group(1)}"
+        match = re.search(r'(?:twitter|x)\.com/([A-Za-z0-9_]+)', url, re.I)
+        if match:
+            return f"profile_{match.group(1).lower()}"
+        return url
+    
+    def get_cached_usernames(self, url: str) -> Optional[Set[str]]:
+        cache_key = self._get_cache_key(url)
+        if cache_key in self.cache:
+            cached = self.cache[cache_key]
+            if isinstance(cached, dict):
+                age = time.time() - cached.get('timestamp', 0)
+                if age < 3600:
+                    usernames = set(cached.get('usernames', []))
+                    log.info(f"[Twitter] Cache HIT: {cache_key} ({int(age)}s)")
+                    return usernames
+        return None
+    
+    def _try_service(self, url: str, service: Dict, timeout: int = None) -> Optional[str]:
+        try:
+            if service.get('prefix', True):
+                clean_url = url.replace('https://', '').replace('http://', '')
+                fetch_url = service['url'] + clean_url
+            else:
+                fetch_url = url
+            
+            actual_timeout = timeout or TWITTER_SCRAPE_TIMEOUT
+            response = SESSION.get(fetch_url, headers=HEADERS, timeout=actual_timeout)
+            if response.status_code == 200 and len(response.text) > 500:
+                log.info(f"[Twitter] {service['name']} OK: {len(response.text):,} chars")
+                return response.text
+        except Exception as e:
+            log.debug(f"[Twitter] {service['name']} failed: {e}")
+        return None
+    
+    def _fetch_readable(self, url: str, timeout: int = None, preferred_service: int = None) -> Optional[str]:
+        if preferred_service is not None and 0 <= preferred_service < len(READER_SERVICES):
+            service = READER_SERVICES[preferred_service]
+            result = self._try_service(url, service, timeout)
+            if result:
+                self.successful_service = service
+                return result
+        
+        if self.successful_service:
+            result = self._try_service(url, self.successful_service, timeout)
+            if result:
+                return result
+        
+        for i, service in enumerate(READER_SERVICES):
+            if preferred_service == i:
+                continue
+            result = self._try_service(url, service, timeout)
+            if result:
+                self.successful_service = service
+                return result
+            time.sleep(0.3)
+        
+        return None
+    
+    def scrape_url(self, url: str, use_cache: bool = True, timeout: int = None, preferred_service: int = None) -> Set[str]:
+        if not TWITTER_SCRAPER_ENABLED or not url:
+            return set()
+        
+        if use_cache:
+            cached = self.get_cached_usernames(url)
+            if cached is not None:
+                return cached
+        
+        log.info(f"[Twitter] Scraping: {url} (timeout={timeout or TWITTER_SCRAPE_TIMEOUT}s, service={preferred_service})")
+        variants = self.url_generator.generate(url)
+        all_usernames = set()
+        
+        for i, variant in enumerate(variants):
+            content = self._fetch_readable(variant, timeout=timeout, preferred_service=preferred_service)
+            if content:
+                usernames = self.matcher.extract_usernames(content)
+                all_usernames.update(usernames)
+                if len(all_usernames) >= TWITTER_MAX_USERNAMES:
+                    break
+            if i < len(variants) - 1:
+                time.sleep(0.5)
+        
+        if all_usernames:
+            cache_key = self._get_cache_key(url)
+            self.cache[cache_key] = {'usernames': sorted(all_usernames), 'timestamp': time.time()}
+            self._save_cache()
+        
+        log.info(f"[Twitter] Found: {len(all_usernames)} usernames")
+        return all_usernames
+
+twitter_scraper = TwitterScraper()
+
+# ====================================================================================
+# END TWITTER SCRAPER CLASSES
+# ====================================================================================
 
 # -----------------------------------------------------------------------------
 # Subs persistence
@@ -98,7 +344,7 @@ def _load_subs_from_file() -> Set[int]:
 def _save_subs_to_file():
     try:
         pathlib.Path(SUBS_FILE).parent.mkdir(parents=True, exist_ok=True)
-        pathlib.Path(SUBS_FILE).write_text("\\n".join(str(x) for x in sorted(SUBS)))
+        pathlib.Path(SUBS_FILE).write_text("\n".join(str(x) for x in sorted(SUBS)))
     except Exception as e:
         log.error("subs save failed: %r", e)
 
@@ -153,25 +399,13 @@ def _fetch_image_bytes(url: str) -> Optional[bytes]:
         return None
 
 def _logo_candidates(mint: str, image_url: Optional[str]) -> List[str]:
-    """
-    Returns logo URLs in priority order (highest quality first).
-    Telegram will display images at best quality available up to 1280px.
-    """
     cands: List[str] = []
-    
-    # Priority 1: Token's official imageUrl from DexScreener (usually best quality)
     if image_url: 
         cands.append(_normalize_ipfs(image_url))
-    
-    # Priority 2: DexScreener CDN (reliable, good quality, 200x200 typically)
     if mint:
         cands.append(f"https://cdn.dexscreener.com/token-icons/solana/{mint}.png")
-    
-    # Priority 3: DexScreener data CDN (backup)
     if mint:
         cands.append(f"https://dd.dexscreener.com/ds-data/tokens/solana/{mint}.png")
-    
-    # Remove duplicates while preserving order
     out=[]; seen=set()
     for u in cands:
         if u and u not in seen: 
@@ -198,7 +432,7 @@ def _canon_url(u: Optional[str]) -> Optional[str]:
     if not (u.startswith("http://") or u.startswith("https://")): u="https://" + u
     return u
 
-_URL_OK = re.compile(r"^https?://[^\\s]+$", re.IGNORECASE)
+_URL_OK = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
 def _valid_url(u: Optional[str]) -> Optional[str]:
     u = _canon_url(u)
     return u if (u and _URL_OK.match(u)) else None
@@ -222,12 +456,8 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
                 handle = it.get("handle")
                 if url and ("twitter" in url.lower() or "x.com" in url.lower() or "twitter" in plat or "x" == plat):
                     u = _canon_url(url)
-                    
-                    # For community URLs, return full URL without extracting handle
                     if "/i/communities/" in u.lower() or "/communities/" in u.lower():
-                        return (None, u)  # No handle for community links
-                    
-                    # For regular profile URLs, extract handle
+                        return (None, u)
                     h = _handle_from_url(u) or _normalize_handle(handle or "")
                     return (h, u)
     for key in ("twitterUrl","twitter","x","twitterHandle"):
@@ -235,12 +465,8 @@ def _extract_x(info: dict) -> Tuple[Optional[str], Optional[str]]:
         if isinstance(v, str) and v.strip():
             if v.lower().startswith("http"):
                 u=_canon_url(v)
-                
-                # For community URLs, return full URL
                 if "/i/communities/" in u.lower() or "/communities/" in u.lower():
                     return (None, u)
-                
-                # For regular profile URLs, extract handle
                 return (_handle_from_url(u), u)
             h=_normalize_handle(v)
             if h: return (h, f"https://x.com/{h}")
@@ -250,17 +476,13 @@ def _get_price_usd(p: dict) -> float:
     v = p.get("priceUsd")
     if v is None and isinstance(p.get("price"), dict):
         v = p["price"].get("usd")
-    try:
-        return float(v) if v is not None else 0.0
+    try: return float(v) if v is not None else 0.0
     except: return 0.0
 
 # -----------------------------------------------------------------------------
 # Dexscreener fetchers
 # -----------------------------------------------------------------------------
-# DexScreener API - ONLY using TOKEN_PROFILES_URL
-# -----------------------------------------------------------------------------
 TOKEN_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
-# Below APIs are NOT used - only profiles API above
 TOKENS_URL         = "https://api.dexscreener.com/tokens/v1/{chainId}/{addresses}"
 SEARCH_NEW_URL     = "https://api.dexscreener.com/latest/dex/search?q=chain:{chain}%20new"
 SEARCH_ALL_URL     = "https://api.dexscreener.com/latest/dex/search?q=chain:{chain}"
@@ -272,89 +494,30 @@ def _get_json(url, timeout=HTTP_TIMEOUT, tries=2):
         try:
             log.debug(f"[API] GET {url} (attempt {i+1}/{tries})")
             r = SESSION.get(url, timeout=timeout)
-            log.debug(f"[API] Status: {r.status_code}, Content-Length: {len(r.content)}")
-            
             if r.status_code == 200: 
                 data = r.json()
-                log.debug(f"[API] ✓ Success - returned {type(data)}")
                 return data
-            else:
-                log.warning(f"[API] ✗ Status {r.status_code} for {url}")
-                
-        except requests.exceptions.Timeout:
-            log.warning(f"[API] ✗ Timeout on {url}")
-        except requests.exceptions.ConnectionError:
-            log.warning(f"[API] ✗ Connection error on {url}")
-        except json.JSONDecodeError as e:
-            log.warning(f"[API] ✗ JSON decode error on {url}: {e}")
         except Exception as e:
-            log.warning(f"[API] ✗ Unexpected error on {url}: {e}")
-            
+            log.warning(f"[API] Error on {url}: {e}")
         time.sleep(0.2*(i+1))
-    
-    log.error(f"[API] ❌ Failed after {tries} attempts: {url}")
     return None
 
-def _discover_search_new(chain=CHAIN_ID) -> List[dict]:
-    j = _get_json(SEARCH_NEW_URL.format(chain=chain), timeout=15) or {}
-    return j.get("pairs",[]) if isinstance(j,dict) else []
-
-def _discover_search_all(chain=CHAIN_ID) -> List[dict]:
-    j = _get_json(SEARCH_ALL_URL.format(chain=chain), timeout=15) or {}
-    return j.get("pairs",[]) if isinstance(j,dict) else []
-
 def _discover_profiles_latest(chain=CHAIN_ID) -> List[dict]:
-    """Fetch latest token profiles which include social links and metadata"""
-    log.info(f"[DEBUG] Calling profiles API: {TOKEN_PROFILES_URL}")
     arr = _get_json(TOKEN_PROFILES_URL, timeout=15) or []
-    log.info(f"[DEBUG] Profiles API response type: {type(arr)}")
-    log.info(f"[DEBUG] Profiles API returned {len(arr) if isinstance(arr, list) else 'N/A'} total items")
-    
-    if isinstance(arr, list) and len(arr) > 0:
-        # Show first item as example
-        log.info(f"[DEBUG] First item sample: {json.dumps(arr[0], indent=2)[:300]}")
-    
-    # Filter for our chain and return full profile objects (not just addresses)
     result = [x for x in arr if isinstance(x,dict) and (x.get("chainId") or "").lower()==chain]
-    log.info(f"[DEBUG] After filtering for chain '{chain}': {len(result)} token profiles")
-    
-    if len(result) > 0:
-        log.info(f"[DEBUG] First 3 token addresses: {[x.get('tokenAddress') for x in result[:3]]}")
-    
     return result
 
 def _best_pool_for_mint(chain, mint) -> Optional[dict]:
     url = TOKEN_PAIRS_URL.format(chainId=chain, address=mint)
-    log.info(f"[DEBUG] Fetching pairs for {mint[:10]}... from {url}")
     arr = _get_json(url, timeout=15) or []
-    log.info(f"[DEBUG] Got {len(arr) if isinstance(arr, list) else 'N/A'} pairs for {mint[:10]}...")
-    
-    if not isinstance(arr,list) or not arr: 
-        log.warning(f"[DEBUG] No pairs found for {mint[:10]}...")
-        return None
-    
+    if not isinstance(arr,list) or not arr: return None
     best=None; key=None
     for p in arr:
         liq = float((p.get("liquidity") or {}).get("usd",0) or 0)
         created = float(p.get("pairCreatedAt") or 0)
         k = (liq, created)
         if best is None or k > key: best, key = p, k
-    
-    if best:
-        liq = float((best.get("liquidity") or {}).get("usd",0) or 0)
-        log.info(f"[DEBUG] Best pair for {mint[:10]}... has ${liq:,.0f} liquidity")
-    
     return best
-
-def _tokens_batch(chain, mints: List[str]) -> List[dict]:
-    out=[]; mints=[m for m in mints if m]
-    for i in range(0,len(mints),30):
-        chunk=",".join(mints[i:i+30])
-        url=TOKENS_URL.format(chainId=chain, addresses=chunk)
-        data=_get_json(url, timeout=20) or []
-        if isinstance(data,list): out.extend(data)
-        time.sleep(0.15)
-    return out
 
 # -----------------------------------------------------------------------------
 # Mirror store
@@ -407,72 +570,30 @@ def _normalize_row_to_token(row: dict) -> Tuple[str, Optional[str], Optional[int
 
 async def ingester(context: ContextTypes.DEFAULT_TYPE):
     try:
-        log.info("=" * 60)
-        log.info("[Ingester] Starting cycle - Token Profiles API ONLY (new tokens with profiles)")
-        log.info("=" * 60)
-        
-        # Get token profiles which include social links and metadata
+        log.info("[Ingester] Starting cycle")
         profiles = _discover_profiles_latest(CHAIN_ID)
-        log.info(f"[Ingester] ✓ Profiles API returned {len(profiles)} {CHAIN_ID} token profiles")
-        
-        if len(profiles) == 0:
-            log.warning("[Ingester] ⚠️ No new token profiles right now")
-            return
+        log.info(f"[Ingester] Got {len(profiles)} profiles")
         
         processed = 0
-        failed = 0
-        
-        for i, profile in enumerate(profiles):
+        for profile in profiles:
             mint = profile.get("tokenAddress")
-            if not mint:
-                continue
-                
-            # Get best pool for this token
+            if not mint: continue
             best = _best_pool_for_mint(CHAIN_ID, mint)
             if best:
                 mint_b, pair_b, created_b = _normalize_row_to_token(best)
-                
-                # CRITICAL: Merge profile data (links, description, etc.) into pair data
-                # The profile contains: url, chainId, tokenAddress, icon, header, description, links[]
                 if "links" in profile and profile["links"]:
-                    # Create info object with links in the format expected by _extract_x
-                    if "info" not in best:
-                        best["info"] = {}
+                    if "info" not in best: best["info"] = {}
                     best["info"]["links"] = profile["links"]
-                    log.info(f"[Ingester] ✓ Merged {len(profile['links'])} social links for {mint[:12]}...")
-                
-                # Also merge icon/image if available
                 if "icon" in profile and profile["icon"]:
-                    if "info" not in best:
-                        best["info"] = {}
+                    if "info" not in best: best["info"] = {}
                     best["info"]["imageUrl"] = profile["icon"]
-                
-                # Extract key stats
-                base = best.get("baseToken") or {}
-                name = base.get("symbol") or base.get("name") or "Unknown"
-                liq = float((best.get("liquidity") or {}).get("usd", 0) or 0)
-                vol24 = float((best.get("volume") or {}).get("h24", 0) or 0)
-                fdv = best.get("fdv")
-                mcap = float(fdv if fdv is not None else (best.get("marketCap") or 0) or 0)
-                age = _pair_age_minutes(time.time()*1000.0, best.get("pairCreatedAt"))
-                
-                if pair_b: 
-                    mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
-                if mint_b: 
-                    mirror_upsert_token(mint_b, pair_b, created_b, best)
-                
-                log.info(f"[Ingester] upsert {mint_b[:12]}.. liq=${liq:,.0f} vol=${vol24:,.0f} mcap=${mcap:,.0f} age={age:.0f}m")
+                if pair_b: mirror_upsert_pair(pair_b, CHAIN_ID, created_b, best)
+                if mint_b: mirror_upsert_token(mint_b, pair_b, created_b, best)
                 processed += 1
-            else:
-                failed += 1
-
         _mirror_save(MIRROR)
-        s = mirror_stats()
-        log.info("=" * 60)
-        log.info(f"[Ingester] ✅ Complete! Processed: {processed}/{len(profiles)} | Mirror: {s['tokens']} tokens, {s['pairs']} pairs")
-        log.info("=" * 60)
+        log.info(f"[Ingester] Complete! Processed: {processed}")
     except Exception as e:
-        log.exception(f"[Ingester] ❌ ERROR: {e}")
+        log.exception(f"[Ingester] ERROR: {e}")
 
 # -----------------------------------------------------------------------------
 # Mirror -> pairs rows
@@ -495,8 +616,6 @@ def _pairs_from_mirror() -> List[dict]:
         age_m = _pair_age_minutes(now_ms, row.get("pairCreatedAt"))
         x_handle, x_url = _extract_x(info)
         
-        # Fix: use x_url directly - it already contains the full URL (community or profile)
-        # from _extract_x which properly handles both cases
         if x_url:
             tw_url_final = x_url
         elif x_handle:
@@ -546,14 +665,13 @@ def decorate_with_first_seen(pairs):
             FIRST_SEEN[tok] = {
                 "first": (cur if cur>0 else 0.0), 
                 "ts": now_ts,
-                "tw_handle": m.get("tw_handle"),  # Store Twitter handle
-                "tw_url": m.get("tw_url")          # Store Twitter URL
+                "tw_handle": m.get("tw_handle"),
+                "tw_url": m.get("tw_url")
             }
             changed=True
         else:
             if rec.get("first",0)==0 and cur>0:
                 rec["first"]=cur; changed=True
-            # Store Twitter info if not already stored
             if not rec.get("tw_handle") and m.get("tw_handle"):
                 rec["tw_handle"] = m.get("tw_handle")
                 changed = True
@@ -565,7 +683,7 @@ def decorate_with_first_seen(pairs):
     if changed: _save_first_seen(FIRST_SEEN)
 
 # -----------------------------------------------------------------------------
-# Followed-by (Nitter)
+# Twitter Overlap Detection (Stored and shown in updates)
 # -----------------------------------------------------------------------------
 def load_my_following() -> Set[str]:
     p = pathlib.Path(MY_FOLLOWING_TXT)
@@ -577,135 +695,166 @@ def load_my_following() -> Set[str]:
             if h: out.add(h)
     except: pass
     return out
+
 MY_HANDLES: Set[str] = load_my_following()
 
-def _followers_cache_path(handle:str) -> pathlib.Path: return FOLLOWERS_CACHE_DIR / f"{handle.lower()}.json"
-def _followers_cache_load(handle:str) -> Optional[Set[str]]:
-    p=_followers_cache_path(handle)
-    if not p.exists(): return None
-    try:
-        j=json.loads(p.read_text(encoding="utf-8"))
-        return set(j.get("followers",[]))
-    except: return None
-def _followers_cache_save(handle:str, followers:Set[str]) -> None:
-    p=_followers_cache_path(handle)
-    p.write_text(json.dumps({"followers": sorted(followers)}, ensure_ascii=False, indent=2), encoding="utf-8")
+def format_twitter_overlap(usernames: Set[str]) -> str:
+    """
+    Format Twitter accounts for display - Option A with 🎯 target emoji
+    Returns HTML-formatted links
+    """
+    if not usernames:
+        return "—"
+    
+    if not MY_HANDLES:
+        acc, total = [], 0
+        for h in sorted(usernames):
+            piece = f'<a href="https://x.com/{h}">@{h}</a>, '
+            if total + len(piece) > 180:
+                break
+            acc.append(piece)
+            total += len(piece)
+        
+        result = "".join(acc).rstrip(", ")
+        if len(usernames) > len(acc):
+            result += f" , … (+{len(usernames) - len(acc)} more)"
+        return result
+    
+    followed = sorted(MY_HANDLES & usernames)
+    not_followed = sorted(usernames - MY_HANDLES)
+    
+    acc, total = [], 0
+    accounts_shown = 0
+    
+    # Followed accounts with 🎯 and HTML links
+    for h in followed:
+        piece = f'<a href="https://x.com/{h}">@{h}</a> 🎯, '
+        if total + len(piece) > 180:
+            break
+        acc.append(piece)
+        total += len(piece)
+        accounts_shown += 1
+    
+    # Non-followed accounts with HTML links
+    for h in not_followed:
+        piece = f'<a href="https://x.com/{h}">@{h}</a>, '
+        if total + len(piece) > 180:
+            break
+        acc.append(piece)
+        total += len(piece)
+        accounts_shown += 1
+    
+    result = "".join(acc).rstrip(", ")
+    
+    if accounts_shown < len(usernames):
+        remaining = len(usernames) - accounts_shown
+        result += f" , … (+{remaining} more)"
+    
+    return result
 
-_NITTER_ENV = os.getenv("NITTER_BASE", "").rstrip("/")
-NITTER_MIRRORS = [m for m in [_NITTER_ENV or None,"https://nitter.net","https://nitter.poast.org","https://ntrqq.com","https://n.l5.ca"] if m]
-_USERNAME_PATTERNS = [
-    re.compile(r'class="username"[^>]*>\\s*@?<bdi>\\s*([^<\\s]+)\\s*</bdi>', re.IGNORECASE),
-    re.compile(r'<a[^>]+class="username"[^>]+href="/([^/"]+)"', re.IGNORECASE),
-    re.compile(r'<span[^>]+class="username"[^>]*>\\s*@?\\s*([^<\\s]+)\\s*</span>', re.IGNORECASE),
-    re.compile(r'href="/([A-Za-z0-9_]{1,15})"[^>]*class="username"', re.IGNORECASE),
-]
-def _nitter_get_from(base, path, params=None):
+async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, token_name: str):
+    """
+    Automatically send a separate scraping message (like manual /scrape)
+    Store results in FIRST_SEEN for use in price updates
+    """
     try:
-        url=f"{base}{path}"; r=SESSION.get(url, params=params or {}, timeout=20)
-        if r.status_code==200 and r.text: 
-            if DEBUG_FB: log.info(f"[nitter] {url} OK len={len(r.text)}")
-            return r.text
-        if DEBUG_FB: log.info(f"[nitter] {url} -> {r.status_code}")
+        log.info(f"[Twitter-Auto] Starting auto-scrape for {token_name} ({token})")
+        
+        # Send initial "scraping..." message
+        scrape_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=f"🔍 Scraping {tw_url}...\n⏳ This may take 30-60 seconds",
+            disable_web_page_preview=True
+        )
+        
+        # DO THE SCRAPING (same code as manual /scrape - proven to work!)
+        usernames = twitter_scraper.scrape_url(tw_url, use_cache=True, timeout=60)
+        
+        if usernames:
+            # Format results exactly like manual /scrape
+            links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in sorted(usernames)[:50]]
+            
+            if MY_HANDLES:
+                overlap = sorted(MY_HANDLES & usernames)
+                if overlap:
+                    overlap_links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in overlap[:20]]
+                    message = (
+                        f"✅ Found {len(usernames)} accounts\n"
+                        f"🎯 {len(overlap)} match your following:\n\n"
+                        + ", ".join(overlap_links)
+                    )
+                    if len(overlap) > 20:
+                        message += f"\n\n... +{len(overlap) - 20} more matches"
+                    message += f"\n\n📋 All accounts:\n" + ", ".join(links[:30])
+                else:
+                    message = f"✅ Found {len(usernames)} accounts:\n\n" + ", ".join(links[:30])
+            else:
+                message = f"✅ Found {len(usernames)} accounts:\n\n" + ", ".join(links[:30])
+            
+            if len(usernames) > 50:
+                message += f"\n\n... +{len(usernames) - 50} more"
+            
+            # STORE RESULTS in FIRST_SEEN for future updates
+            overlap_text = format_twitter_overlap(usernames)
+            if token in FIRST_SEEN:
+                FIRST_SEEN[token]["tw_overlap"] = overlap_text
+                FIRST_SEEN[token]["tw_scraped"] = True
+                FIRST_SEEN[token]["tw_scraped_at"] = int(time.time())
+                _save_first_seen(FIRST_SEEN)
+                log.info(f"[Twitter-Auto] ✓ Stored overlap for {token}: {overlap_text[:50]}...")
+            else:
+                log.warning(f"[Twitter-Auto] Token {token} not in FIRST_SEEN, cannot store overlap")
+            
+            # Edit the scraping message with full results
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=scrape_msg.message_id,
+                text=message,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            
+            log.info(f"[Twitter-Auto] ✓ Auto-scrape complete for {token_name}")
+            
+        else:
+            # No usernames found
+            if token in FIRST_SEEN:
+                FIRST_SEEN[token]["tw_overlap"] = "—"
+                FIRST_SEEN[token]["tw_scraped"] = True
+                _save_first_seen(FIRST_SEEN)
+            
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=scrape_msg.message_id,
+                text="⚠️ No usernames found. This could mean:\n"
+                     "• Empty community/profile\n"
+                     "• Private account\n"
+                     "• Reader services blocked\n"
+                     "• Invalid URL format"
+            )
+            
+            log.warning(f"[Twitter-Auto] No usernames found for {token}")
+            
     except Exception as e:
-        if DEBUG_FB: log.info(f"[nitter] fetch error {base}{path}: {e}")
-    return None
-def _nitter_get(path, params=None):
-    for base in NITTER_MIRRORS:
-        html=_nitter_get_from(base, path, params)
-        if html: return html
-    return None
-def _parse_nitter_usernames(html: str) -> List[str]:
-    out=[]; 
-    if not html: return out
-    for pat in _USERNAME_PATTERNS:
-        for m in pat.finditer(html):
-            h=_normalize_handle(m.group(1))
-            if h: out.append(h)
-    seen=set(); uniq=[]
-    for h in out:
-        if h not in seen: uniq.append(h); seen.add(h)
-    if DEBUG_FB: log.info(f"[nitter] parsed {len(uniq)} usernames")
-    return uniq
-def _followers_scrape_nitter(handle: str, max_total: int = 1000, max_pages: int = 8) -> Optional[Set[str]]:
-    if not handle: return None
-    def _fetch_page(pg:int):
-        if pg==1:
-            html=_nitter_get(f"/{handle}/followers", params=None)
-            if html: return html
-        html=_nitter_get(f"/{handle}/followers", params={"page": str(pg)})
-        if html: return html
-        return _nitter_get(f"/{handle}/followers", params={"p": str(pg)})
-    seen=set()
-    for page in range(1, max_pages+1):
-        html=_fetch_page(page)
-        if not html:
-            if DEBUG_FB: log.info(f"[nitter] page {page}: no html"); break
-        low=html.lower()
-        if ("rate limit" in low) or ("please try again later" in low):
-            if DEBUG_FB: log.info(f"[nitter] page {page}: rate-limited"); break
-        batch=_parse_nitter_usernames(html)
-        batch=[h for h in batch if h and h != handle.lower()]
-        before=len(seen)
-        for h in batch: seen.add(h)
-        if DEBUG_FB: log.info(f"[nitter] page {page}: +{len(seen)-before}, total={len(seen)}")
-        if len(seen)==before or len(seen)>=max_total: break
-        time.sleep(0.6)
-    return seen if seen else None
-def _followers_static_load(handle: str) -> Optional[Set[str]]:
-    handle=(handle or "").strip().lower()
-    if not handle: return None
-    txt = FB_STATIC_DIR / f"{handle}.txt"
-    jsn = FB_STATIC_DIR / f"{handle}.json"
-    try:
-        if txt.exists():
-            out=[]
-            for line in txt.read_text(encoding="utf-8", errors="ignore").splitlines():
-                h=_normalize_handle(line)
-                if h: out.append(h)
-            return set(out)
-        if jsn.exists():
-            j=json.loads(jsn.read_text(encoding="utf-8"))
-            if isinstance(j,dict) and isinstance(j.get("followers"),list):
-                return { _normalize_handle(x) for x in j["followers"] if _normalize_handle(x) }
-    except Exception as e:
-        log.warning(f"static followers load failed for {handle}: {e}")
-    return None
-def fetch_followers_v2(handle: str, max_total: int = 1000) -> Optional[Set[str]]:
-    if not handle: return None
-    static=_followers_static_load(handle)
-    if static: return static
-    cached=_followers_cache_load(handle)
-    if cached: return cached
-    scraped=_followers_scrape_nitter(handle, max_total=max_total)
-    if scraped:
-        _followers_cache_save(handle, scraped)
-        return scraped
-    if TW_BEARER: return None
-    return None
-def load_my_following() -> Set[str]:
-    p=pathlib.Path(MY_FOLLOWING_TXT)
-    if not p.exists(): return set()
-    out=set()
-    try:
-        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            h=_normalize_handle(line)
-            if h: out.add(h)
-    except: pass
-    return out
-MY_HANDLES = load_my_following()
-def overlap_line(tw_handle: Optional[str]) -> str:
-    if not tw_handle or not MY_HANDLES: return "—"
-    followers = fetch_followers_v2(tw_handle, max_total=1000)
-    if not followers: return "—"
-    overlap = sorted(MY_HANDLES & followers)
-    if not overlap: return "—"
-    acc=[]; total=0
-    for h in overlap:
-        piece="@"+h+", "
-        if total + len(piece) > 180: break
-        acc.append(piece); total += len(piece)
-    s="".join(acc).rstrip(", ")
-    return s + (" , …" if len(overlap) > len(acc) else "")
+        log.exception(f"[Twitter-Auto] Auto-scrape failed for {token}: {e}")
+        # Mark as failed so it doesn't block updates
+        if token in FIRST_SEEN:
+            FIRST_SEEN[token]["tw_overlap"] = "—"
+            FIRST_SEEN[token]["tw_scraped"] = True
+            _save_first_seen(FIRST_SEEN)
+
+# -----------------------------------------------------------------------------
+# Best token selection
+# -----------------------------------------------------------------------------
+def best_per_token(pairs: List[dict]) -> List[dict]:
+    best_map={}
+    for p in pairs:
+        tok=p.get("token") or ""
+        if not tok: continue
+        liq=float(p.get("liquidity_usd") or 0)
+        cur=best_map.get(tok)
+        if cur is None or liq>float(cur.get("liquidity_usd") or 0): best_map[tok]=p
+    return sorted(best_map.values(), key=lambda x:float(x.get("mcap_usd") or 0), reverse=True)
 
 # -----------------------------------------------------------------------------
 # UI builders
@@ -728,11 +877,13 @@ def link_keyboard(m: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("GMGN",        url=_norm(gm_url)),
          InlineKeyboardButton("X",           url=_norm(x_url))],
     ])
+
 def _pct_str(first: float, cur: float) -> str:
     if first > 0 and cur >= 0:
         d = (cur - first) / first * 100.0
         return f"{'+' if d>=0 else ''}{d:.1f}%"
     return "n/a"
+
 def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     BLUE, BANK, XEMO = "🔵","🏦","𝕏"
     fire_or_ice = "🧊" if is_update else ("🔥" if m.get("is_first_time") else "🧊")
@@ -753,7 +904,7 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
         f"{price_line}\n"
         f"📈 <b>Vol 24h:</b> ${m['vol24_usd']:,.0f}\n"
         f"⏱️ <b>Age:</b> {int(m['age_min'])} min\n"
-        f"{XEMO} <b>Followed by:</b> {html_escape(fb_text)}"
+        f"{XEMO} <b>Followed by:</b> {fb_text}"
     )
 
 # -----------------------------------------------------------------------------
@@ -762,118 +913,125 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
 def _is_keyboard_reject(e: Exception) -> bool:
     s=str(e).lower()
     return ("reply markup is not allowed" in s) or ("keyboardbuttonpolltype" in s) or ("polls are unallowed" in s)
+
 def _merge_current(into: dict, cur: dict) -> dict:
     if not into or not cur: return into
     for k in ("pair","price_usd","liquidity_usd","mcap_usd","vol24_usd","age_min","url","logo_hint","tw_url","tw_handle"):
         v = cur.get(k)
         if v is not None: into[k] = v
     return into
-async def _send_or_photo(bot, chat_id:int, caption:str, kb, token:str, logo_hint:str, pin:bool=False) -> Optional[int]:
-    cap = caption if len(caption) <= 900 else (caption[:870] + " …")
-    async def _maybe_pin(msg_id: int):
-        if not pin: return
-        try:
-            await bot.pin_chat_message(chat_id=chat_id, message_id=msg_id, disable_notification=True)
-        except Exception as e:
-            log.info(f"Pin attempt failed (non-fatal): {e}")
-    for u in _logo_candidates(token, logo_hint):
-        if not u: continue
-        try:
-            msg = await bot.send_photo(chat_id=chat_id, photo=u, caption=cap, parse_mode="HTML", reply_markup=kb)
-            await _maybe_pin(msg.message_id); return msg.message_id
-        except BadRequest as e:
-            if _is_keyboard_reject(e):
-                try:
-                    msg = await bot.send_photo(chat_id=chat_id, photo=u, caption=cap, parse_mode="HTML")
-                    await _maybe_pin(msg.message_id); return msg.message_id
-                except Exception as e2:
-                    log.error(f"retry send_photo no-kb failed: {e2}")
-        except Exception as e:
-            log.warning(f"send_photo error: {e}")
-        data=_fetch_image_bytes(u)
-        if data:
-            try:
-                msg = await bot.send_photo(chat_id=chat_id, photo=data, caption=cap, parse_mode="HTML", reply_markup=kb)
-                await _maybe_pin(msg.message_id); return msg.message_id
-            except BadRequest as e:
-                if _is_keyboard_reject(e):
-                    try:
-                        msg = await bot.send_photo(chat_id=chat_id, photo=data, caption=cap, parse_mode="HTML")
-                        await _maybe_pin(msg.message_id); return msg.message_id
-                    except Exception as e2:
-                        log.error(f"retry send_photo bytes no-kb failed: {e2}")
-            except Exception as e:
-                log.warning(f"send_photo bytes error: {e}")
-    if os.path.exists(FALLBACK_LOGO):
-        try:
-            with open(FALLBACK_LOGO,"rb") as f:
-                msg = await bot.send_photo(chat_id=chat_id, photo=f, caption=cap, parse_mode="HTML", reply_markup=kb)
-                await _maybe_pin(msg.message_id); return msg.message_id
-        except BadRequest as e:
-            if _is_keyboard_reject(e):
-                try:
-                    with open(FALLBACK_LOGO,"rb") as f:
-                        msg = await bot.send_photo(chat_id=chat_id, photo=f, caption=cap, parse_mode="HTML")
-                        await _maybe_pin(msg.message_id); return msg.message_id
-                except Exception as e2:
-                    log.error(f"retry send_photo fallback no-kb failed: {e2}")
-        except Exception as e:
-            log.warning(f"send_photo fallback error: {e}")
-    try:
-        msg = await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML",
-                                     disable_web_page_preview=True, reply_markup=kb)
-        await _maybe_pin(msg.message_id); return msg.message_id
-    except BadRequest as e:
-        if _is_keyboard_reject(e):
-            try:
-                msg = await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML",
-                                             disable_web_page_preview=True)
-                await _maybe_pin(msg.message_id); return msg.message_id
-            except Exception as e2:
-                log.error(f"retry send_message no-kb failed: {e2}")
-        try:
-            msg = await bot.send_message(chat_id=chat_id, text=caption, disable_web_page_preview=True)
-            await _maybe_pin(msg.message_id); return msg.message_id
-        except BadRequest as e2:
-            if "chat not found" in str(e2).lower():
-                _remove_bad_sub(chat_id)
-        except Exception as e2:
-            log.warning(f"send_message plain error: {e2}")
-    return None
 
-# -----------------------------------------------------------------------------
-# Alert/update
-# -----------------------------------------------------------------------------
-def best_per_token(pairs):
-    best={}
-    for m in pairs:
-        key = (m.get("token") or f"__unknown__:{m.get('pair') or m.get('url') or id(m)}")
-        if key not in best or m["vol24_usd"]>best[key]["vol24_usd"]:
-            best[key] = m
-    return list(best.values())
+async def _send_or_photo(bot, chat_id:int, caption:str, kb, token:str, logo_hint:str, pin:bool=False) -> Optional[int]:
+    cands = _logo_candidates(token, logo_hint)
+    msg_id = None
+    
+    for logo_url in cands:
+        try:
+            byt = _fetch_image_bytes(logo_url)
+            if byt:
+                msg = await bot.send_photo(chat_id=chat_id, photo=byt, caption=caption, reply_markup=kb, parse_mode="HTML")
+                if pin:
+                    try: await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+                    except: pass
+                msg_id = msg.message_id
+                break
+        except BadRequest as e:
+            if _is_keyboard_reject(e):
+                msg = await bot.send_photo(chat_id=chat_id, photo=byt, caption=caption, parse_mode="HTML")
+                msg_id = msg.message_id
+                break
+        except Exception:
+            pass
+    
+    if msg_id is None:
+        try:
+            msg = await bot.send_message(chat_id=chat_id, text=caption, reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+            msg_id = msg.message_id
+        except BadRequest as e:
+            if _is_keyboard_reject(e):
+                msg = await bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
+                msg_id = msg.message_id
+        except Exception as e:
+            log.exception(f"send error chat={chat_id}: {e}")
+            _remove_bad_sub(chat_id)
+    
+    return msg_id
+
 def passes_filters_for_alert(m: dict) -> bool:
-    try:
-        liq=float(m.get("liquidity_usd") or 0)
-        mcap=float(m.get("mcap_usd") or 0)
-        vol24=float(m.get("vol24_usd") or 0)
-        age=float(m.get("age_min") or float("inf"))
-        liq_ok  = liq >= MIN_LIQ_USD
-        age_ok  = (age <= MAX_AGE_MIN) if age != float("inf") else True
-        mcap_ok = (mcap >= MIN_MCAP_USD) if mcap > 0 else True
-        vol_ok  = (vol24 >= MIN_VOL_H24_USD) if vol24 > 0 else True
-        return liq_ok and age_ok and mcap_ok and vol_ok
-    except: return False
-async def send_new_token(bot, chat_id:int, m:dict):
-    fb_text = overlap_line(m.get("tw_handle"))
+    liq = float(m.get("liquidity_usd") or 0)
+    mcap = float(m.get("mcap_usd") or 0)
+    vol = float(m.get("vol24_usd") or 0)
+    age = float(m.get("age_min") or 0)
+    if liq < MIN_LIQ_USD: return False
+    if mcap < MIN_MCAP_USD: return False
+    if vol < MIN_VOL_H24_USD: return False
+    if age > MAX_AGE_MIN: return False
+    return True
+
+async def send_new_token(bot, chat_id: int, m: dict):
+    """
+    Send new token alert immediately with "—" for Twitter
+    Trigger automatic separate scraping message in background
+    """
+    # Send alert immediately with placeholder
+    fb_text = "—"
+    m["_is_update"] = False
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
-    key=(chat_id, m.get("token") or "")
+    key = (chat_id, m.get("token") or "")
     should_pin = key not in LAST_PINNED
-    msg_id = await _send_or_photo(bot, chat_id, caption, kb, token=m.get("token"), logo_hint=m.get("logo_hint"), pin=should_pin)
-    if should_pin and msg_id: LAST_PINNED[key]=msg_id
-async def send_price_update(bot, chat_id:int, m:dict):
-    fb_text="—"; caption = build_caption(m, fb_text, is_update=True); kb=link_keyboard(m)
-    await _send_or_photo(bot, chat_id, caption, kb, token=m.get("token"), logo_hint=m.get("logo_hint"), pin=False)
+    
+    msg_id = await _send_or_photo(
+        bot, chat_id, caption, kb,
+        token=m.get("token"),
+        logo_hint=m.get("logo_hint"),
+        pin=should_pin
+    )
+    
+    if should_pin and msg_id:
+        LAST_PINNED[key] = msg_id
+    
+    # Trigger automatic scraping in background (separate message)
+    tw_url = m.get("tw_url")
+    if tw_url and TWITTER_SCRAPER_ENABLED and tw_url != "https://x.com/":
+        task = asyncio.create_task(
+            send_auto_scrape_message(
+                bot, 
+                chat_id, 
+                m["token"], 
+                tw_url, 
+                m.get("name", "Token")
+            )
+        )
+        # Keep task reference to prevent garbage collection
+        BACKGROUND_TASKS.add(task)
+        task.add_done_callback(BACKGROUND_TASKS.discard)
+        
+        log.info(f"[Alert] Sent alert for {m.get('name')} + triggered auto-scrape")
+    else:
+        log.info(f"[Alert] Sent alert for {m.get('name')} (no Twitter URL to scrape)")
+
+async def send_price_update(bot, chat_id: int, m: dict):
+    """
+    Send price update - uses stored Twitter overlap from auto-scrape
+    """
+    token = m.get("token")
+    record = FIRST_SEEN.get(token, {})
+    
+    # Use stored overlap from automatic scraping
+    fb_text = record.get("tw_overlap", "—")
+    
+    m["_is_update"] = True
+    caption = build_caption(m, fb_text, is_update=True)
+    kb = link_keyboard(m)
+    
+    await _send_or_photo(
+        bot, chat_id, caption, kb,
+        token=m.get("token"),
+        logo_hint=m.get("logo_hint"),
+        pin=False
+    )
+
 async def do_trade_push(bot):
     try:
         pairs = best_per_token(_pairs_from_mirror())
@@ -894,9 +1052,11 @@ async def do_trade_push(bot):
                 await asyncio.sleep(0.05)
     except Exception as e:
         log.exception(f"do_trade_push error: {e}")
+
 async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
     log.info(f"🔥 [tick] auto_trade fired (interval={TRADE_SUMMARY_SEC}s)")
     await do_trade_push(context.bot)
+
 async def updater(context: ContextTypes.DEFAULT_TYPE):
     log.info(f"🧊 [tick] updater fired (interval={UPDATE_INTERVAL_SEC}s)")
     try:
@@ -912,12 +1072,10 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
             if not cur: continue
             base=cur.get("baseToken") or {}; info=cur.get("info") or {}
             
-            # Use stored Twitter info for consistency (profile links won't be in fresh pair data)
             stored_tw_handle = first_rec.get("tw_handle")
             stored_tw_url = first_rec.get("tw_url")
             fresh_tw_handle, fresh_tw_url = _extract_x(info)
             
-            # Prefer stored values since profile data isn't refreshed on updates
             final_tw_handle = stored_tw_handle or fresh_tw_handle
             final_tw_url = stored_tw_url or fresh_tw_url
             if not final_tw_url and final_tw_handle:
@@ -937,7 +1095,7 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
                 "url": _valid_url(cur.get("url") or ""),
                 "logo_hint": info.get("imageUrl") or base.get("logo") or "",
                 "tw_handle": final_tw_handle,
-                "tw_url": final_tw_url,  # Use the URL directly, don't re-validate
+                "tw_url": final_tw_url,
                 "axiom": AXIOM_WEB_URL.format(pair=cur.get("pairAddress") or "") if cur.get("pairAddress") else "https://axiom.trade/",
                 "gmgn": GMGN_WEB_URL.format(mint=token) if token else "https://gmgn.ai/",
             }
@@ -953,193 +1111,190 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
         log.exception(f"updater job error: {e}")
 
 # -----------------------------------------------------------------------------
-# Commands
+# Bot commands
 # -----------------------------------------------------------------------------
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global SUBS
-    SUBS.add(u.effective_chat.id); _save_subs_to_file()
-    await u.message.reply_text(f"✅ Subscribed. 🔥 /trade every {TRADE_SUMMARY_SEC}s + 🧊 updates every {UPDATE_INTERVAL_SEC}s (stop after {UPDATE_MAX_DURATION_MIN} min).")
-async def cmd_id(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text(str(u.effective_chat.id))
-async def cmd_sub(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    global SUBS
-    SUBS.add(u.effective_chat.id); _save_subs_to_file()
-    await u.message.reply_text("✅ Subscribed.")
-async def cmd_unsub(u:Update,c:ContextTypes.DEFAULT_TYPE):
-    global SUBS
-    SUBS.discard(u.effective_chat.id); _save_subs_to_file()
-    await u.message.reply_text("❎ Unsubscribed.")
-async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    s=mirror_stats()
+    SUBS.add(u.effective_chat.id)
+    _save_subs_to_file()
     await u.message.reply_text(
-        f"Subscribers: {len(SUBS)} | 🔥 /trade every {TRADE_SUMMARY_SEC}s | 🧊 updates every {UPDATE_INTERVAL_SEC}s | Top/tick {TOP_N_PER_TICK or 'unlimited'} | Max alert age {int(MAX_AGE_MIN)}m | Update stop {UPDATE_MAX_DURATION_MIN}m\\n"
-        f"Mirror -> tokens: {s['tokens']} | pairs: {s['pairs']}"
+        f"✅ Subscribed!\n\n"
+        f"🔥 New tokens every {TRADE_SUMMARY_SEC}s\n"
+        f"🧊 Price updates every {UPDATE_INTERVAL_SEC}s\n"
+        f"🐦 Twitter scraper: {'Enabled (Hybrid mode)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n"
+        f"⏱️ Quick attempt: 60s, then retries up to 5min\n\n"
+        f"Commands:\n"
+        f"/status - Bot stats\n"
+        f"/trade [N] - Show N tokens\n"
+        f"/scrape <url> - Manually scrape Twitter URL"
     )
+
+async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(str(u.effective_chat.id))
+
+async def cmd_sub(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    global SUBS
+    SUBS.add(u.effective_chat.id)
+    _save_subs_to_file()
+    await u.message.reply_text("✅ Subscribed.")
+
+async def cmd_unsub(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    global SUBS
+    SUBS.discard(u.effective_chat.id)
+    _save_subs_to_file()
+    await u.message.reply_text("❎ Unsubscribed.")
+
+async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    s = mirror_stats()
+    cache_size = len(twitter_scraper.cache)
+    await u.message.reply_text(
+        f"📊 Bot Status\n\n"
+        f"Subscribers: {len(SUBS)}\n"
+        f"Tracked tokens: {len(TRACKED)}\n"
+        f"Mirror tokens: {s['tokens']}\n"
+        f"Following: {len(MY_HANDLES)} handles\n"
+        f"Twitter cache: {cache_size} entries\n"
+        f"Active scrape tasks: {len(BACKGROUND_TASKS)}\n"
+        f"Scraper: {'✅ Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else '❌ Disabled'}"
+    )
+
 async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = (u.message.text or "").split()
     manual_cap = None
     if len(args) >= 2:
-        try: manual_cap = max(1, int(args[1]))
-        except: manual_cap = None
-    pairs = best_per_token(_pairs_from_mirror())
+        try:
+            manual_cap = max(1, int(args[1]))
+        except:
+            manual_cap = None
+    pairs = _pairs_from_mirror()
+    pairs = best_per_token(pairs)
     decorate_with_first_seen(pairs)
-    cap = manual_cap if manual_cap is not None else (TOP_N_PER_TICK if TOP_N_PER_TICK > 0 else 10_000)
-    sent=0
+    cap = manual_cap if manual_cap is not None else (TOP_N_PER_TICK if TOP_N_PER_TICK > 0 else 10)
+    sent = 0
     for m in pairs:
-        if not passes_filters_for_alert(m): continue
+        if not passes_filters_for_alert(m):
+            continue
         TRACKED.add(m["token"])
         if m.get("is_first_time"):
             await send_new_token(c.bot, u.effective_chat.id, m)
         else:
             await send_price_update(c.bot, u.effective_chat.id, m)
         sent += 1
-        if sent >= cap: break
+        if sent >= cap:
+            break
         await asyncio.sleep(0.05)
     if sent == 0:
         await u.message.reply_text("(trade) no matches with current filters.")
-async def cmd_fb(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    args = (u.message.text or "").split()
-    if len(args) < 2: await u.message.reply_text("Usage: /fb handle"); return
-    handle = _normalize_handle(args[1])
-    ol = overlap_line(handle)
-    await u.message.reply_text(f"Overlap for @{handle}:\\n{ol}")
+
 async def cmd_mirror(u: Update, c: ContextTypes.DEFAULT_TYPE):
     s = mirror_stats()
     await u.message.reply_text(json.dumps(s, indent=2))
 
-async def cmd_tokens(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Show all tokens currently in mirror with their stats"""
-    args = (u.message.text or "").split()
-    limit = 20  # Default show 20
-    
-    if len(args) >= 2:
-        try:
-            limit = min(int(args[1]), 100)  # Max 100
-        except:
-            limit = 20
-    
-    pairs = _pairs_from_mirror()
-    
-    if not pairs:
-        await u.message.reply_text("No tokens in mirror yet. Wait for ingester to run.")
+async def cmd_scrape(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Manual Twitter scrape command: /scrape <twitter_url>"""
+    args = (u.message.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await u.message.reply_text(
+            "Usage: /scrape <twitter_url>\n\n"
+            "Examples:\n"
+            "• /scrape https://x.com/elonmusk\n"
+            "• /scrape https://x.com/i/communities/123456\n"
+            "• /scrape https://twitter.com/vitalikbuterin"
+        )
         return
     
-    # Sort by volume (highest first)
-    pairs.sort(key=lambda x: x.get("vol24_usd", 0), reverse=True)
+    url = args[1].strip()
     
-    # Count how many pass filters
-    passing = sum(1 for m in pairs if passes_filters_for_alert(m))
+    # Validate Twitter URL
+    if not ('twitter.com' in url.lower() or 'x.com' in url.lower()):
+        await u.message.reply_text("❌ Please provide a valid Twitter/X URL")
+        return
     
-    # Take top N
-    shown = pairs[:limit]
+    await u.message.reply_text(f"🔍 Scraping {url}...\n⏳ This may take 30-60 seconds")
     
-    response = f"📊 <b>Mirror Stats</b>\n"
-    response += f"Total tokens: {len(pairs)}\n"
-    response += f"Pass filters: {passing} ✅\n"
-    response += f"Fail filters: {len(pairs) - passing} ❌\n\n"
-    response += f"<b>Top {len(shown)} tokens (by volume):</b>\n\n"
-    
-    for i, m in enumerate(shown, 1):
-        name = m.get("name", "Unknown")
-        token = m.get("token", "")
-        token_short = token[:8] + "..." if len(token) > 8 else token
-        liq = m.get("liquidity_usd", 0)
-        mcap = m.get("mcap_usd", 0)
-        vol24 = m.get("vol24_usd", 0)
-        age = m.get("age_min", 0)
+    try:
+        # Force refresh (don't use cache) for manual scrapes
+        usernames = twitter_scraper.scrape_url(url, use_cache=False, timeout=60)
         
-        # Check which filters it passes
-        passes_liq = liq >= MIN_LIQ_USD
-        passes_mcap = mcap >= MIN_MCAP_USD if mcap > 0 else True
-        passes_vol = vol24 >= MIN_VOL_H24_USD if vol24 > 0 else True
-        passes_age = age <= MAX_AGE_MIN if age != float("inf") else True
-        passes_all = passes_liq and passes_mcap and passes_vol and passes_age
-        
-        status = "✅" if passes_all else "❌"
-        
-        response += f"{i}. {status} <b>{html_escape(name)}</b>\n"
-        response += f"   💧 Liq: ${liq:,.0f} {'✅' if passes_liq else f'❌ (need ${MIN_LIQ_USD:,.0f})'}\n"
-        
-        if not passes_mcap:
-            response += f"   📊 MCap: ${mcap:,.0f} ❌ (need ${MIN_MCAP_USD:,.0f})\n"
-        
-        if not passes_vol:
-            response += f"   📈 Vol: ${vol24:,.0f} ❌ (need ${MIN_VOL_H24_USD:,.0f})\n"
-        
-        if not passes_age and age != float("inf"):
-            response += f"   ⏰ Age: {age:.0f}m ❌ (max {MAX_AGE_MIN:.0f}m)\n"
-        
-        response += "\n"
-        
-        if len(response) > 3800:  # Telegram message limit with buffer
-            await u.message.reply_text(response, parse_mode="HTML")
-            response = ""
-    
-    if response:
-        await u.message.reply_text(response, parse_mode="HTML")
+        if usernames:
+            # Show up to 50 usernames with clickable links
+            links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in sorted(usernames)[:50]]
+            
+            # Show overlap with MY_HANDLES if available
+            if MY_HANDLES:
+                overlap = sorted(MY_HANDLES & usernames)
+                if overlap:
+                    overlap_links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in overlap[:20]]
+                    message = (
+                        f"✅ Found {len(usernames)} accounts\n"
+                        f"🎯 {len(overlap)} match your following:\n\n"
+                        + ", ".join(overlap_links)
+                    )
+                    if len(overlap) > 20:
+                        message += f"\n\n... +{len(overlap) - 20} more matches"
+                    message += f"\n\n📋 All accounts:\n" + ", ".join(links[:30])
+                else:
+                    message = f"✅ Found {len(usernames)} accounts:\n\n" + ", ".join(links)
+            else:
+                message = f"✅ Found {len(usernames)} accounts:\n\n" + ", ".join(links)
+            
+            if len(usernames) > 50:
+                message += f"\n\n... +{len(usernames) - 50} more"
+            
+            await u.message.reply_text(message, parse_mode="HTML")
+        else:
+            await u.message.reply_text(
+                "⚠️ No usernames found. This could mean:\n"
+                "• Empty community/profile\n"
+                "• Private account\n"
+                "• Reader services blocked\n"
+                "• Invalid URL format"
+            )
+    except Exception as e:
+        log.error(f"Scrape command failed: {e}")
+        await u.message.reply_text(f"❌ Error: {str(e)}")
 
-async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Reset bot memory - makes all tokens new again (🔥)"""
-    global FIRST_SEEN, TRACKED, LAST_PINNED
-    
-    # Backup current data
-    backup_data = {
-        "first_seen_count": len(FIRST_SEEN),
-        "tracked_count": len(TRACKED),
-        "timestamp": int(time.time())
-    }
-    
-    # Clear in-memory data
-    FIRST_SEEN.clear()
-    TRACKED.clear()
-    LAST_PINNED.clear()
-    
-    # Save empty first_seen to disk
-    _save_first_seen(FIRST_SEEN)
-    
-    await u.message.reply_text(
-        f"🔥 <b>Bot Memory Reset!</b>\n\n"
-        f"Cleared:\n"
-        f"  • {backup_data['first_seen_count']} tokens from first-seen\n"
-        f"  • {backup_data['tracked_count']} tracked tokens\n"
-        f"  • All pinned message tracking\n\n"
-        f"All tokens will now be treated as NEW and get 🔥 fire emoji!\n\n"
-        f"Note: Mirror cache preserved. Use /mirror to see current state.",
-        parse_mode="HTML"
-    )
+async def cmd_clearcache(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Clear Twitter cache"""
+    count = len(twitter_scraper.cache)
+    twitter_scraper.cache.clear()
+    twitter_scraper._save_cache()
+    await u.message.reply_text(f"🗑️ Cleared {count} cached Twitter results")
 
-# -----------------------------------------------------------------------------
-# Bot & jobs
-# -----------------------------------------------------------------------------
 async def _post_init(app: Application):
-    global SUBS
+    global SUBS, MY_HANDLES
     SUBS = _load_subs_from_file()
+    MY_HANDLES = load_my_following()
     if ALERT_CHAT_ID:
-        SUBS.add(ALERT_CHAT_ID); _save_subs_to_file()
+        SUBS.add(ALERT_CHAT_ID)
+        _save_subs_to_file()
     await _validate_subs(app.bot)
     log.info(f"Subscribers: {sorted(SUBS)}")
+    log.info(f"Following: {len(MY_HANDLES)} handles")
+    log.info(f"Twitter scraper: {'Enabled (Auto separate messages mode)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
-application.add_handler(CommandHandler("start",      cmd_start))
-application.add_handler(CommandHandler("id",         cmd_id))
-application.add_handler(CommandHandler("subscribe",  cmd_sub))
-application.add_handler(CommandHandler("unsubscribe",cmd_unsub))
-application.add_handler(CommandHandler("status",     cmd_status))
-application.add_handler(CommandHandler("trade",      cmd_trade))
-application.add_handler(CommandHandler("fb",         cmd_fb))
-application.add_handler(CommandHandler("mirror",     cmd_mirror))
-application.add_handler(CommandHandler("tokens",     cmd_tokens))
-application.add_handler(CommandHandler("reset",      cmd_reset))
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("id", cmd_id))
+application.add_handler(CommandHandler("subscribe", cmd_sub))
+application.add_handler(CommandHandler("unsubscribe", cmd_unsub))
+application.add_handler(CommandHandler("status", cmd_status))
+application.add_handler(CommandHandler("trade", cmd_trade))
+application.add_handler(CommandHandler("mirror", cmd_mirror))
+application.add_handler(CommandHandler("scrape", cmd_scrape))
+application.add_handler(CommandHandler("clearcache", cmd_clearcache))
 
-# -----------------------------------------------------------------------------
-# FastAPI + webhook
-# -----------------------------------------------------------------------------
 app = FastAPI(title="Telegram Webhook")
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/")
 async def health_root():
-    return {"ok": True}
+    return {
+        "ok": True, 
+        "twitter_scraper": TWITTER_SCRAPER_ENABLED, 
+        "mode": "auto_separate_messages",
+        "active_tasks": len(BACKGROUND_TASKS)
+    }
 
 @app.get("/healthz")
 async def healthz():
@@ -1147,10 +1302,11 @@ async def healthz():
 
 @app.on_event("startup")
 async def _startup():
-    global SUBS, FIRST_SEEN, MIRROR
+    global SUBS, FIRST_SEEN, MIRROR, MY_HANDLES
     SUBS = _load_subs_from_file()
     FIRST_SEEN = _load_first_seen()
     MIRROR = _mirror_load()
+    MY_HANDLES = load_my_following()
     asyncio.create_task(_start_bot_and_jobs())
 
 async def _start_bot_and_jobs():
@@ -1161,7 +1317,7 @@ async def _start_bot_and_jobs():
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
         jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
         await application.start()
-        log.info("Bot initialized & started")
+        log.info("Bot initialized & started with Twitter Auto Separate Messages mode")
     except Exception as e:
         log.exception("Bot startup failed: %r", e)
 
@@ -1174,20 +1330,12 @@ async def _shutdown():
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
-    if token != TG: return Response(status_code=403)
+    if token != TG:
+        return Response(status_code=403)
     try:
         data: Dict[str, Any] = await request.json()
-    except Exception as e:
-        log.warning("webhook json parse error: %r", e); return Response(status_code=400)
-    try:
-        msg = data.get("message") or {}
-        text = (msg.get("text") or "").strip().lower()
-        chat = msg.get("chat") or {}
-        chat_id = chat.get("id")
-        if chat_id and text in ("/start", "/ping", "/id", "ping"):
-            await application.bot.send_message(chat_id, "✅ Webhook round-trip OK")
-    except Exception as e:
-        log.warning("webhook fast-reply error: %r", e)
+    except:
+        return Response(status_code=400)
     try:
         update = Update.de_json(data, application.bot)
         await application.process_update(update)
