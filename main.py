@@ -701,56 +701,32 @@ MY_HANDLES: Set[str] = load_my_following()
 def format_twitter_overlap(usernames: Set[str]) -> str:
     """
     Format Twitter accounts for display - Option A with 🎯 target emoji
-    Returns HTML-formatted links
+    Returns HTML-formatted links with NO character limit - shows ALL accounts
     """
     if not usernames:
         return "—"
     
     if not MY_HANDLES:
-        acc, total = [], 0
-        for h in sorted(usernames):
-            piece = f'<a href="https://x.com/{h}">@{h}</a>, '
-            if total + len(piece) > 180:
-                break
-            acc.append(piece)
-            total += len(piece)
-        
-        result = "".join(acc).rstrip(", ")
-        if len(usernames) > len(acc):
-            result += f" , … (+{len(usernames) - len(acc)} more)"
-        return result
+        # No following list - show ALL accounts
+        links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in sorted(usernames)]
+        return ", ".join(links)
     
+    # Split into followed (🎯) and not followed
     followed = sorted(MY_HANDLES & usernames)
     not_followed = sorted(usernames - MY_HANDLES)
     
-    acc, total = [], 0
-    accounts_shown = 0
+    # Build complete list: followed first with 🎯, then others
+    all_links = []
     
-    # Followed accounts with 🎯 and HTML links
+    # Add followed accounts with 🎯
     for h in followed:
-        piece = f'<a href="https://x.com/{h}">@{h}</a> 🎯, '
-        if total + len(piece) > 180:
-            break
-        acc.append(piece)
-        total += len(piece)
-        accounts_shown += 1
+        all_links.append(f'<a href="https://x.com/{h}">@{h}</a> 🎯')
     
-    # Non-followed accounts with HTML links
+    # Add non-followed accounts
     for h in not_followed:
-        piece = f'<a href="https://x.com/{h}">@{h}</a>, '
-        if total + len(piece) > 180:
-            break
-        acc.append(piece)
-        total += len(piece)
-        accounts_shown += 1
+        all_links.append(f'<a href="https://x.com/{h}">@{h}</a>')
     
-    result = "".join(acc).rstrip(", ")
-    
-    if accounts_shown < len(usernames):
-        remaining = len(usernames) - accounts_shown
-        result += f" , … (+{remaining} more)"
-    
-    return result
+    return ", ".join(all_links)
 
 async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, token_name: str):
     """
@@ -758,6 +734,11 @@ async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, t
     Store results in FIRST_SEEN for use in price updates
     """
     try:
+        # Double-check if already scraped (race condition protection)
+        if token in FIRST_SEEN and FIRST_SEEN[token].get("tw_scraped", False):
+            log.info(f"[Twitter-Auto] Skipping {token_name} - already scraped")
+            return
+        
         log.info(f"[Twitter-Auto] Starting auto-scrape for {token_name} ({token})")
         
         # Send initial "scraping..." message
@@ -800,8 +781,14 @@ async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, t
                 FIRST_SEEN[token]["tw_overlap"] = overlap_text
                 FIRST_SEEN[token]["tw_scraped"] = True
                 FIRST_SEEN[token]["tw_scraped_at"] = int(time.time())
+                
+                # FORCE SAVE AND VERIFY
                 _save_first_seen(FIRST_SEEN)
-                log.info(f"[Twitter-Auto] ✓ Stored overlap for {token}: {overlap_text[:50]}...")
+                test_load = _load_first_seen()
+                if test_load.get(token, {}).get("tw_overlap") == overlap_text:
+                    log.info(f"[Twitter-Auto] ✓ SAVED & VERIFIED: {token} - {len(usernames)} accounts")
+                else:
+                    log.error(f"[Twitter-Auto] ✗ SAVE VERIFICATION FAILED for {token}!")
             else:
                 log.warning(f"[Twitter-Auto] Token {token} not in FIRST_SEEN, cannot store overlap")
             
@@ -970,11 +957,15 @@ def passes_filters_for_alert(m: dict) -> bool:
 
 async def send_new_token(bot, chat_id: int, m: dict):
     """
-    Send new token alert immediately with "—" for Twitter
-    Trigger automatic separate scraping message in background
+    Send new token alert immediately
+    Trigger automatic separate scraping message in background (if not already scraped)
     """
-    # Send alert immediately with placeholder
-    fb_text = "—"
+    token = m.get("token")
+    
+    # Check if we already have stored Twitter data
+    record = FIRST_SEEN.get(token, {})
+    fb_text = record.get("tw_overlap", "—")
+    
     m["_is_update"] = False
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
@@ -991,14 +982,16 @@ async def send_new_token(bot, chat_id: int, m: dict):
     if should_pin and msg_id:
         LAST_PINNED[key] = msg_id
     
-    # Trigger automatic scraping in background (separate message)
+    # Only scrape if NOT already scraped
     tw_url = m.get("tw_url")
-    if tw_url and TWITTER_SCRAPER_ENABLED and tw_url != "https://x.com/":
+    already_scraped = record.get("tw_scraped", False)
+    
+    if tw_url and TWITTER_SCRAPER_ENABLED and tw_url != "https://x.com/" and not already_scraped:
         task = asyncio.create_task(
             send_auto_scrape_message(
                 bot, 
                 chat_id, 
-                m["token"], 
+                token, 
                 tw_url, 
                 m.get("name", "Token")
             )
@@ -1008,18 +1001,28 @@ async def send_new_token(bot, chat_id: int, m: dict):
         task.add_done_callback(BACKGROUND_TASKS.discard)
         
         log.info(f"[Alert] Sent alert for {m.get('name')} + triggered auto-scrape")
+    elif already_scraped:
+        log.info(f"[Alert] Sent alert for {m.get('name')} (already scraped, showing stored data)")
     else:
         log.info(f"[Alert] Sent alert for {m.get('name')} (no Twitter URL to scrape)")
 
 async def send_price_update(bot, chat_id: int, m: dict):
     """
-    Send price update - uses stored Twitter overlap from auto-scrape
+    Send price update - uses stored Twitter overlap from m dict OR FIRST_SEEN
     """
     token = m.get("token")
-    record = FIRST_SEEN.get(token, {})
     
-    # Use stored overlap from automatic scraping
-    fb_text = record.get("tw_overlap", "—")
+    # Try to get from m dict first (passed from updater), fallback to FIRST_SEEN
+    fb_text = m.get("tw_overlap")
+    if not fb_text or fb_text == "—":
+        record = FIRST_SEEN.get(token, {})
+        fb_text = record.get("tw_overlap", "—")
+    
+    # Debug logging
+    if fb_text != "—":
+        log.info(f"[Update] {m.get('name')} - Using Twitter data: {len(fb_text)} chars")
+    else:
+        log.warning(f"[Update] {m.get('name')} - No Twitter data available")
     
     m["_is_update"] = True
     caption = build_caption(m, fb_text, is_update=True)
@@ -1058,9 +1061,14 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
     await do_trade_push(context.bot)
 
 async def updater(context: ContextTypes.DEFAULT_TYPE):
+    global FIRST_SEEN
     log.info(f"🧊 [tick] updater fired (interval={UPDATE_INTERVAL_SEC}s)")
     try:
         if not TRACKED: return
+        
+        # Reload FIRST_SEEN to get latest scraped data
+        FIRST_SEEN = _load_first_seen()
+        
         now_ts=int(time.time())
         log.info(f"[updater] refreshing {len(TRACKED)} tracked tokens")
         for token in list(TRACKED):
@@ -1099,6 +1107,10 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
                 "axiom": AXIOM_WEB_URL.format(pair=cur.get("pairAddress") or "") if cur.get("pairAddress") else "https://axiom.trade/",
                 "gmgn": GMGN_WEB_URL.format(mint=token) if token else "https://gmgn.ai/",
             }
+            
+            # CRITICAL: Add stored Twitter overlap to update dict!
+            m["tw_overlap"] = first_rec.get("tw_overlap", "—")
+            
             if float(m.get("age_min", 1e9)) >= MAX_AGE_MIN:
                 TRACKED.discard(token); continue
             m["first_mcap_usd"] = float(first_rec.get("first", 0.0))
@@ -1121,8 +1133,7 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"✅ Subscribed!\n\n"
         f"🔥 New tokens every {TRADE_SUMMARY_SEC}s\n"
         f"🧊 Price updates every {UPDATE_INTERVAL_SEC}s\n"
-        f"🐦 Twitter scraper: {'Enabled (Hybrid mode)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n"
-        f"⏱️ Quick attempt: 60s, then retries up to 5min\n\n"
+        f"🐦 Twitter scraper: {'Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n\n"
         f"Commands:\n"
         f"/status - Bot stats\n"
         f"/trade [N] - Show N tokens\n"
