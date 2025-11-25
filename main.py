@@ -78,6 +78,7 @@ SUBS_FILE        = _p("SUBS_FILE",       "/tmp/telegram-bot/subscribers.txt")
 FIRST_SEEN_FILE  = _p("FIRST_SEEN_FILE", "/tmp/telegram-bot/first_seen_caps.json")
 FALLBACK_LOGO    = _p("FALLBACK_LOGO",   "/tmp/telegram-bot/solana_fallback.png")
 MY_FOLLOWING_TXT = _p("MY_FOLLOWING_TXT","/home/user/telegram-bot/handles.partial.txt")
+TWITTER_BLACKLIST_TXT = _p("TWITTER_BLACKLIST_TXT","/home/user/telegram-bot/twitter_blacklist.txt")
 FOLLOWERS_CACHE_DIR = pathlib.Path(_p("FOLLOWERS_CACHE_DIR", "/tmp/telegram-bot/followers_cache"))
 FB_STATIC_DIR       = pathlib.Path(_p("FB_STATIC_DIR",       "/tmp/telegram-bot/followers_static"))
 MIRROR_JSON         = _p("MIRROR_JSON", "/tmp/telegram-bot/mirror.json")
@@ -112,14 +113,16 @@ BACKGROUND_TASKS: Set[asyncio.Task] = set()
 
 class TwitterPatternMatcher:
     def __init__(self):
-        self.username_patterns = [
-            re.compile(r'@([A-Za-z0-9_]{1,15})\b'),
-            re.compile(r'(?:twitter|x)\.com/([A-Za-z0-9_]{1,15})(?:/|$|\?)', re.I),
-            re.compile(r'\(@([A-Za-z0-9_]+)\)\s+on\s+(?:X|Twitter)', re.I),
-            re.compile(r'Posted\s+by\s+@?([A-Za-z0-9_]+)', re.I),
-            re.compile(r'^@?([A-Za-z0-9_]+)\s*[:\-]', re.M),
+        # HIGH-VALUE PATTERNS ONLY (posters, moderators, retweeters)
+        self.high_value_patterns = [
+            re.compile(r'Posted\s+by\s+@?([A-Za-z0-9_]+)', re.I),           # Posters
+            re.compile(r'Moderator[s]?\s*:?\s*@?([A-Za-z0-9_]+)', re.I),    # Moderators
+            re.compile(r'\bRT\s+@([A-Za-z0-9_]+)', re.I),                   # Retweets
+            re.compile(r'^@([A-Za-z0-9_]+)\s*:', re.M),                     # Line start (posters)
         ]
+        
         self.blacklist = {
+            # Generic terms
             'twitter', 'x', 'i', 'home', 'explore', 'search', 'status', 'web', 
             'notifications', 'messages', 'settings', 'profile', 'lists', 'bookmarks',
             'community', 'communities', 'trending', 'moments',
@@ -136,18 +139,46 @@ class TwitterPatternMatcher:
             'month', 'day', 'hour', 'minute', 'second',
             'one', 'two', 'three', 'all', 'none', 'other', 'new', 'old', 'latest',
             'api', 'url', 'link', 'https', 'http', 'www', 'com', 'net', 'org',
+            # User-requested additions
+            'ca', 'conversation',
         }
     
+    def _is_valid_username(self, username: str) -> bool:
+        """Check if username is valid (not blacklisted, not all-numbers, not one-letter)"""
+        username = username.lower()
+        
+        # Blacklist check
+        if username in self.blacklist:
+            return False
+        
+        # Length check
+        if len(username) < 1 or len(username) > 15:
+            return False
+        
+        # Must be alphanumeric with underscores
+        if not username.replace('_', '').isalnum():
+            return False
+        
+        # Reject one-letter usernames (e.g., @a, @x, @z)
+        if len(username) == 1:
+            return False
+        
+        # Reject all-numbers usernames (e.g., @123, @456789)
+        if username.replace('_', '').isdigit():
+            return False
+        
+        return True
+    
     def extract_usernames(self, text: str) -> Set[str]:
+        """Extract HIGH-VALUE usernames only (posters, moderators, retweeters)"""
         usernames = set()
-        for pattern in self.username_patterns:
+        
+        for pattern in self.high_value_patterns:
             for match in pattern.finditer(text):
                 username = match.group(1).lower()
-                if (username not in self.blacklist and 
-                    len(username) <= 15 and 
-                    len(username) >= 1 and 
-                    username.replace('_', '').isalnum()):
+                if self._is_valid_username(username):
                     usernames.add(username)
+        
         return usernames
 
 class URLVariantGenerator:
@@ -698,22 +729,66 @@ def load_my_following() -> Set[str]:
 
 MY_HANDLES: Set[str] = load_my_following()
 
+def load_twitter_blacklist() -> Set[str]:
+    """Load blacklisted Twitter usernames from file"""
+    p = pathlib.Path(TWITTER_BLACKLIST_TXT)
+    if not p.exists():
+        # Create empty blacklist file with instructions
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                "# Twitter Username Blacklist\n"
+                "# One username per line (without @)\n"
+                "# Lines starting with # are comments\n"
+                "# Example:\n"
+                "# spambot123\n"
+                "# generic_user\n"
+            )
+            log.info(f"[Blacklist] Created empty blacklist file: {TWITTER_BLACKLIST_TXT}")
+        except Exception as e:
+            log.warning(f"[Blacklist] Could not create file: {e}")
+        return set()
+    
+    out = set()
+    try:
+        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            # Skip empty lines and comments
+            if not line or line.startswith("#"):
+                continue
+            h = _normalize_handle(line)
+            if h:
+                out.add(h)
+        log.info(f"[Blacklist] Loaded {len(out)} blacklisted usernames")
+    except Exception as e:
+        log.warning(f"[Blacklist] Load failed: {e}")
+    return out
+
+TWITTER_BLACKLIST: Set[str] = load_twitter_blacklist()
+
 def format_twitter_overlap(usernames: Set[str]) -> str:
     """
     Format Twitter accounts for display - Option A with 🎯 target emoji
     Returns HTML-formatted links with NO character limit - shows ALL accounts
+    Filters out blacklisted usernames
     """
     if not usernames:
         return "—"
     
+    # Filter out blacklisted usernames
+    filtered_usernames = usernames - TWITTER_BLACKLIST
+    
+    if not filtered_usernames:
+        return "—"
+    
     if not MY_HANDLES:
-        # No following list - show ALL accounts
-        links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in sorted(usernames)]
+        # No following list - show ALL non-blacklisted accounts
+        links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in sorted(filtered_usernames)]
         return ", ".join(links)
     
     # Split into followed (🎯) and not followed
-    followed = sorted(MY_HANDLES & usernames)
-    not_followed = sorted(usernames - MY_HANDLES)
+    followed = sorted(MY_HANDLES & filtered_usernames)
+    not_followed = sorted(filtered_usernames - MY_HANDLES)
     
     # Build complete list: followed first with 🎯, then others
     all_links = []
@@ -1137,7 +1212,8 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Commands:\n"
         f"/status - Bot stats\n"
         f"/trade [N] - Show N tokens\n"
-        f"/scrape <url> - Manually scrape Twitter URL"
+        f"/scrape <url> - Manually scrape Twitter URL\n"
+        f"/blacklist - Manage username blacklist"
     )
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1164,6 +1240,7 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Tracked tokens: {len(TRACKED)}\n"
         f"Mirror tokens: {s['tokens']}\n"
         f"Following: {len(MY_HANDLES)} handles\n"
+        f"Blacklisted: {len(TWITTER_BLACKLIST)} usernames\n"
         f"Twitter cache: {cache_size} entries\n"
         f"Active scrape tasks: {len(BACKGROUND_TASKS)}\n"
         f"Scraper: {'✅ Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else '❌ Disabled'}"
@@ -1272,16 +1349,65 @@ async def cmd_clearcache(u: Update, c: ContextTypes.DEFAULT_TYPE):
     twitter_scraper._save_cache()
     await u.message.reply_text(f"🗑️ Cleared {count} cached Twitter results")
 
+async def cmd_blacklist(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """View or reload Twitter blacklist"""
+    global TWITTER_BLACKLIST
+    args = (u.message.text or "").split()
+    
+    if len(args) == 1:
+        # Show current blacklist
+        if not TWITTER_BLACKLIST:
+            await u.message.reply_text(
+                f"🚫 Blacklist is empty\n\n"
+                f"To add usernames, edit:\n"
+                f"<code>{TWITTER_BLACKLIST_TXT}</code>\n\n"
+                f"Then use: /blacklist reload",
+                parse_mode="HTML"
+            )
+        else:
+            blacklist_str = ", ".join(f"@{h}" for h in sorted(TWITTER_BLACKLIST)[:50])
+            if len(TWITTER_BLACKLIST) > 50:
+                blacklist_str += f" ... +{len(TWITTER_BLACKLIST) - 50} more"
+            await u.message.reply_text(
+                f"🚫 Blacklisted usernames ({len(TWITTER_BLACKLIST)}):\n\n"
+                f"{blacklist_str}\n\n"
+                f"File: <code>{TWITTER_BLACKLIST_TXT}</code>\n"
+                f"Use: /blacklist reload to refresh",
+                parse_mode="HTML"
+            )
+    
+    elif len(args) == 2 and args[1].lower() == "reload":
+        # Reload blacklist from file
+        old_count = len(TWITTER_BLACKLIST)
+        TWITTER_BLACKLIST = load_twitter_blacklist()
+        new_count = len(TWITTER_BLACKLIST)
+        
+        await u.message.reply_text(
+            f"🔄 Blacklist reloaded!\n\n"
+            f"Before: {old_count} usernames\n"
+            f"After: {new_count} usernames\n"
+            f"Change: {'+' if new_count >= old_count else ''}{new_count - old_count}"
+        )
+    
+    else:
+        await u.message.reply_text(
+            "Usage:\n"
+            "/blacklist - View current blacklist\n"
+            "/blacklist reload - Reload from file"
+        )
+
 async def _post_init(app: Application):
-    global SUBS, MY_HANDLES
+    global SUBS, MY_HANDLES, TWITTER_BLACKLIST
     SUBS = _load_subs_from_file()
     MY_HANDLES = load_my_following()
+    TWITTER_BLACKLIST = load_twitter_blacklist()
     if ALERT_CHAT_ID:
         SUBS.add(ALERT_CHAT_ID)
         _save_subs_to_file()
     await _validate_subs(app.bot)
     log.info(f"Subscribers: {sorted(SUBS)}")
     log.info(f"Following: {len(MY_HANDLES)} handles")
+    log.info(f"Blacklist: {len(TWITTER_BLACKLIST)} usernames")
     log.info(f"Twitter scraper: {'Enabled (Auto separate messages mode)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
@@ -1294,6 +1420,7 @@ application.add_handler(CommandHandler("trade", cmd_trade))
 application.add_handler(CommandHandler("mirror", cmd_mirror))
 application.add_handler(CommandHandler("scrape", cmd_scrape))
 application.add_handler(CommandHandler("clearcache", cmd_clearcache))
+application.add_handler(CommandHandler("blacklist", cmd_blacklist))
 
 app = FastAPI(title="Telegram Webhook")
 app.add_middleware(GZipMiddleware, minimum_size=512)
@@ -1313,11 +1440,12 @@ async def healthz():
 
 @app.on_event("startup")
 async def _startup():
-    global SUBS, FIRST_SEEN, MIRROR, MY_HANDLES
+    global SUBS, FIRST_SEEN, MIRROR, MY_HANDLES, TWITTER_BLACKLIST
     SUBS = _load_subs_from_file()
     FIRST_SEEN = _load_first_seen()
     MIRROR = _mirror_load()
     MY_HANDLES = load_my_following()
+    TWITTER_BLACKLIST = load_twitter_blacklist()
     asyncio.create_task(_start_bot_and_jobs())
 
 async def _start_bot_and_jobs():
