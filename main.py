@@ -97,15 +97,11 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Reader services for bypassing IP blocks
+# Reader services for bypassing IP blocks (proven working services only)
 READER_SERVICES = [
     {"name": "Jina", "url": "https://r.jina.ai/", "prefix": True},
     {"name": "Txtify", "url": "https://txtify.it/", "prefix": True},
     {"name": "12ft", "url": "https://12ft.io/", "prefix": True},
-    {"name": "Simplified", "url": "https://simplified.com/read/", "prefix": True},
-    {"name": "Readability", "url": "https://readability-api.vercel.app/api?url=", "prefix": False},
-    {"name": "Mercury", "url": "https://mercury.postlight.com/parser?url=", "prefix": False},
-    {"name": "DiffBot", "url": "https://article.api.diffbot.com/v3/article?url=", "prefix": False},
 ]
 
 # Global set to keep task references (prevent garbage collection)
