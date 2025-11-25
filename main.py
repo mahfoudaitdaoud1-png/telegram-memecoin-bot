@@ -766,6 +766,25 @@ def load_twitter_blacklist() -> Set[str]:
 
 TWITTER_BLACKLIST: Set[str] = load_twitter_blacklist()
 
+def _save_blacklist_to_file():
+    """Save blacklist to file"""
+    try:
+        p = pathlib.Path(TWITTER_BLACKLIST_TXT)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        
+        lines = [
+            "# Twitter Username Blacklist",
+            "# Managed by bot - edit via /blacklist commands",
+            "# Or edit this file manually and restart bot",
+            ""
+        ]
+        lines.extend(sorted(TWITTER_BLACKLIST))
+        
+        p.write_text("\n".join(lines))
+        log.info(f"[Blacklist] Saved {len(TWITTER_BLACKLIST)} usernames to file")
+    except Exception as e:
+        log.error(f"[Blacklist] Save failed: {e}")
+
 def format_twitter_overlap(usernames: Set[str]) -> str:
     """
     Format Twitter accounts for display - Option A with 🎯 target emoji
@@ -1212,8 +1231,10 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Commands:\n"
         f"/status - Bot stats\n"
         f"/trade [N] - Show N tokens\n"
-        f"/scrape <url> - Manually scrape Twitter URL\n"
-        f"/blacklist - Manage username blacklist"
+        f"/scrape <url> - Manually scrape Twitter\n"
+        f"/blacklist - Manage username blacklist\n"
+        f"/blacklist add username - Block a user\n"
+        f"/blacklist remove username - Unblock a user"
     )
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1350,50 +1371,101 @@ async def cmd_clearcache(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(f"🗑️ Cleared {count} cached Twitter results")
 
 async def cmd_blacklist(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """View or reload Twitter blacklist"""
+    """Manage Twitter blacklist"""
     global TWITTER_BLACKLIST
     args = (u.message.text or "").split()
     
+    # /blacklist - show current list
     if len(args) == 1:
-        # Show current blacklist
         if not TWITTER_BLACKLIST:
             await u.message.reply_text(
-                f"🚫 Blacklist is empty\n\n"
-                f"To add usernames, edit:\n"
-                f"<code>{TWITTER_BLACKLIST_TXT}</code>\n\n"
-                f"Then use: /blacklist reload",
-                parse_mode="HTML"
+                "🚫 Blacklist is empty\n\n"
+                "Usage:\n"
+                "/blacklist add username\n"
+                "/blacklist remove username\n"
+                "/blacklist clear"
             )
         else:
             blacklist_str = ", ".join(f"@{h}" for h in sorted(TWITTER_BLACKLIST)[:50])
             if len(TWITTER_BLACKLIST) > 50:
                 blacklist_str += f" ... +{len(TWITTER_BLACKLIST) - 50} more"
             await u.message.reply_text(
-                f"🚫 Blacklisted usernames ({len(TWITTER_BLACKLIST)}):\n\n"
+                f"🚫 Blacklisted ({len(TWITTER_BLACKLIST)}):\n\n"
                 f"{blacklist_str}\n\n"
-                f"File: <code>{TWITTER_BLACKLIST_TXT}</code>\n"
-                f"Use: /blacklist reload to refresh",
-                parse_mode="HTML"
+                f"Commands:\n"
+                f"/blacklist add username\n"
+                f"/blacklist remove username\n"
+                f"/blacklist clear"
             )
+        return
     
-    elif len(args) == 2 and args[1].lower() == "reload":
-        # Reload blacklist from file
-        old_count = len(TWITTER_BLACKLIST)
-        TWITTER_BLACKLIST = load_twitter_blacklist()
-        new_count = len(TWITTER_BLACKLIST)
+    command = args[1].lower()
+    
+    # /blacklist add username
+    if command == "add":
+        if len(args) < 3:
+            await u.message.reply_text("Usage: /blacklist add username")
+            return
+        
+        username = _normalize_handle(args[2])
+        if not username:
+            await u.message.reply_text("❌ Invalid username")
+            return
+        
+        if username in TWITTER_BLACKLIST:
+            await u.message.reply_text(f"⚠️ @{username} is already blacklisted")
+            return
+        
+        TWITTER_BLACKLIST.add(username)
+        _save_blacklist_to_file()
         
         await u.message.reply_text(
-            f"🔄 Blacklist reloaded!\n\n"
-            f"Before: {old_count} usernames\n"
-            f"After: {new_count} usernames\n"
-            f"Change: {'+' if new_count >= old_count else ''}{new_count - old_count}"
+            f"✅ Added to blacklist: @{username}\n"
+            f"Total: {len(TWITTER_BLACKLIST)}"
         )
+    
+    # /blacklist remove username
+    elif command == "remove":
+        if len(args) < 3:
+            await u.message.reply_text("Usage: /blacklist remove username")
+            return
+        
+        username = _normalize_handle(args[2])
+        if not username:
+            await u.message.reply_text("❌ Invalid username")
+            return
+        
+        if username not in TWITTER_BLACKLIST:
+            await u.message.reply_text(f"⚠️ @{username} is not in blacklist")
+            return
+        
+        TWITTER_BLACKLIST.remove(username)
+        _save_blacklist_to_file()
+        
+        await u.message.reply_text(
+            f"✅ Removed from blacklist: @{username}\n"
+            f"Total: {len(TWITTER_BLACKLIST)}"
+        )
+    
+    # /blacklist clear
+    elif command == "clear":
+        if not TWITTER_BLACKLIST:
+            await u.message.reply_text("Blacklist is already empty")
+            return
+        
+        count = len(TWITTER_BLACKLIST)
+        TWITTER_BLACKLIST.clear()
+        _save_blacklist_to_file()
+        
+        await u.message.reply_text(f"🗑️ Cleared {count} usernames from blacklist")
     
     else:
         await u.message.reply_text(
             "Usage:\n"
-            "/blacklist - View current blacklist\n"
-            "/blacklist reload - Reload from file"
+            "/blacklist - View list\n"
+            "/blacklist add username\n"
+            "/blacklist remove username\n"
+            "/blacklist clear"
         )
 
 async def _post_init(app: Application):
