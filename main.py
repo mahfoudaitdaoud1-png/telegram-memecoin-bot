@@ -102,6 +102,10 @@ READER_SERVICES = [
     {"name": "Jina", "url": "https://r.jina.ai/", "prefix": True},
     {"name": "Txtify", "url": "https://txtify.it/", "prefix": True},
     {"name": "12ft", "url": "https://12ft.io/", "prefix": True},
+    {"name": "Simplified", "url": "https://simplified.com/read/", "prefix": True},
+    {"name": "Readability", "url": "https://readability-api.vercel.app/api?url=", "prefix": False},
+    {"name": "Mercury", "url": "https://mercury.postlight.com/parser?url=", "prefix": False},
+    {"name": "DiffBot", "url": "https://article.api.diffbot.com/v3/article?url=", "prefix": False},
 ]
 
 # Global set to keep task references (prevent garbage collection)
@@ -287,39 +291,61 @@ class TwitterScraper:
                 clean_url = url.replace('https://', '').replace('http://', '')
                 fetch_url = service['url'] + clean_url
             else:
-                fetch_url = url
+                fetch_url = service['url'] + url
             
             actual_timeout = timeout or TWITTER_SCRAPE_TIMEOUT
             response = SESSION.get(fetch_url, headers=HEADERS, timeout=actual_timeout)
+            
             if response.status_code == 200 and len(response.text) > 500:
-                log.info(f"[Twitter] {service['name']} OK: {len(response.text):,} chars")
+                log.info(f"[Twitter] ✅ {service['name']} SUCCESS: {len(response.text):,} chars")
                 return response.text
+            else:
+                log.warning(f"[Twitter] ❌ {service['name']} FAILED: Status {response.status_code}, {len(response.text)} chars")
+                return None
+                
+        except requests.exceptions.Timeout:
+            log.warning(f"[Twitter] ❌ {service['name']} TIMEOUT after {actual_timeout}s")
+        except requests.exceptions.ConnectionError as e:
+            log.warning(f"[Twitter] ❌ {service['name']} CONNECTION ERROR: {str(e)[:100]}")
         except Exception as e:
-            log.debug(f"[Twitter] {service['name']} failed: {e}")
+            log.warning(f"[Twitter] ❌ {service['name']} ERROR: {type(e).__name__}: {str(e)[:100]}")
         return None
     
     def _fetch_readable(self, url: str, timeout: int = None, preferred_service: int = None) -> Optional[str]:
+        log.info(f"[Twitter] Attempting to fetch: {url[:80]}...")
+        
         if preferred_service is not None and 0 <= preferred_service < len(READER_SERVICES):
             service = READER_SERVICES[preferred_service]
+            log.info(f"[Twitter] Trying PREFERRED service: {service['name']}")
             result = self._try_service(url, service, timeout)
             if result:
                 self.successful_service = service
                 return result
         
         if self.successful_service:
+            log.info(f"[Twitter] Trying LAST SUCCESSFUL service: {self.successful_service['name']}")
             result = self._try_service(url, self.successful_service, timeout)
             if result:
                 return result
+            else:
+                log.warning(f"[Twitter] Last successful service {self.successful_service['name']} failed, trying others...")
         
+        log.info(f"[Twitter] Rotating through all {len(READER_SERVICES)} services...")
         for i, service in enumerate(READER_SERVICES):
             if preferred_service == i:
                 continue
+            
+            log.info(f"[Twitter] [{i+1}/{len(READER_SERVICES)}] Trying: {service['name']}")
             result = self._try_service(url, service, timeout)
+            
             if result:
                 self.successful_service = service
+                log.info(f"[Twitter] ✅ {service['name']} succeeded! Will use this service first next time.")
                 return result
+            
             time.sleep(0.3)
         
+        log.error(f"[Twitter] ❌ ALL {len(READER_SERVICES)} services failed for: {url[:80]}")
         return None
     
     def scrape_url(self, url: str, use_cache: bool = True, timeout: int = None, preferred_service: int = None) -> Set[str]:
@@ -331,17 +357,28 @@ class TwitterScraper:
             if cached is not None:
                 return cached
         
-        log.info(f"[Twitter] Scraping: {url} (timeout={timeout or TWITTER_SCRAPE_TIMEOUT}s, service={preferred_service})")
+        log.info(f"[Twitter] 🔍 Starting scrape: {url}")
+        log.info(f"[Twitter] Config: timeout={timeout or TWITTER_SCRAPE_TIMEOUT}s, preferred_service={preferred_service}, available_services={len(READER_SERVICES)}")
+        
         variants = self.url_generator.generate(url)
         all_usernames = set()
+        services_tried = []
         
         for i, variant in enumerate(variants):
+            log.info(f"[Twitter] Trying variant {i+1}/{len(variants)}: {variant}")
             content = self._fetch_readable(variant, timeout=timeout, preferred_service=preferred_service)
+            
             if content:
                 usernames = self.matcher.extract_usernames(content)
+                log.info(f"[Twitter] ✅ Extracted {len(usernames)} usernames from variant {i+1}")
                 all_usernames.update(usernames)
+                
                 if len(all_usernames) >= TWITTER_MAX_USERNAMES:
+                    log.info(f"[Twitter] Reached max usernames ({TWITTER_MAX_USERNAMES}), stopping")
                     break
+            else:
+                log.warning(f"[Twitter] ❌ No content retrieved from variant {i+1}")
+            
             if i < len(variants) - 1:
                 time.sleep(0.5)
         
@@ -349,8 +386,10 @@ class TwitterScraper:
             cache_key = self._get_cache_key(url)
             self.cache[cache_key] = {'usernames': sorted(all_usernames), 'timestamp': time.time()}
             self._save_cache()
+            log.info(f"[Twitter] ✅ SUCCESS: Found {len(all_usernames)} unique usernames, cached as '{cache_key}'")
+        else:
+            log.error(f"[Twitter] ❌ FAILED: No usernames found after trying {len(variants)} variants with {len(READER_SERVICES)} services")
         
-        log.info(f"[Twitter] Found: {len(all_usernames)} usernames")
         return all_usernames
 
 twitter_scraper = TwitterScraper()
@@ -907,14 +946,17 @@ async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, t
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=scrape_msg.message_id,
-                text="⚠️ No usernames found. This could mean:\n"
-                     "• Empty community/profile\n"
-                     "• Private account\n"
-                     "• Reader services blocked\n"
-                     "• Invalid URL format"
+                text="⚠️ No usernames found. Possible causes:\n\n"
+                     "• Empty/private community or profile\n"
+                     "• Reader services are blocked/rate limited\n"
+                     "• Twitter changed their format\n"
+                     "• Invalid URL\n\n"
+                     "Check bot logs for detailed error messages.\n"
+                     "Try manual: /scrape <url>"
             )
             
-            log.warning(f"[Twitter-Auto] No usernames found for {token}")
+            log.error(f"[Twitter-Auto] ❌ SCRAPE FAILED for {token}: No usernames found from {tw_url}")
+            log.error(f"[Twitter-Auto] Check if reader services are working or being rate limited")
             
     except Exception as e:
         log.exception(f"[Twitter-Auto] Auto-scrape failed for {token}: {e}")
@@ -1468,6 +1510,56 @@ async def cmd_blacklist(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "/blacklist clear"
         )
 
+async def cmd_testreaders(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Test which reader services are working"""
+    await u.message.reply_text("🔍 Testing all reader services...\n⏳ This will take ~30 seconds")
+    
+    test_url = "https://x.com/elonmusk"
+    results = []
+    
+    for i, service in enumerate(READER_SERVICES):
+        try:
+            log.info(f"[Test] Testing service {i+1}/{len(READER_SERVICES)}: {service['name']}")
+            
+            if service.get('prefix', True):
+                clean_url = test_url.replace('https://', '')
+                fetch_url = service['url'] + clean_url
+            else:
+                fetch_url = service['url'] + test_url
+            
+            response = SESSION.get(fetch_url, headers=HEADERS, timeout=10)
+            
+            if response.status_code == 200 and len(response.text) > 500:
+                results.append(f"✅ {service['name']}: Working ({len(response.text):,} chars)")
+                log.info(f"[Test] ✅ {service['name']} PASSED")
+            else:
+                results.append(f"❌ {service['name']}: Status {response.status_code}, {len(response.text)} chars")
+                log.warning(f"[Test] ❌ {service['name']} FAILED: {response.status_code}")
+                
+        except requests.exceptions.Timeout:
+            results.append(f"⏱️ {service['name']}: Timeout (>10s)")
+            log.warning(f"[Test] ⏱️ {service['name']} TIMEOUT")
+        except Exception as e:
+            results.append(f"❌ {service['name']}: {type(e).__name__}")
+            log.warning(f"[Test] ❌ {service['name']} ERROR: {e}")
+        
+        time.sleep(1)  # Be nice, don't hammer
+    
+    working = sum(1 for r in results if r.startswith("✅"))
+    
+    message = (
+        f"📊 Reader Services Test Results\n"
+        f"Test URL: {test_url}\n\n"
+        + "\n".join(results) +
+        f"\n\n✅ Working: {working}/{len(READER_SERVICES)}\n"
+        f"❌ Failed: {len(READER_SERVICES) - working}/{len(READER_SERVICES)}"
+    )
+    
+    if working == 0:
+        message += "\n\n⚠️ ALL SERVICES FAILED!\nPossible causes:\n• Rate limited\n• IP blocked\n• Services down"
+    
+    await u.message.reply_text(message)
+
 async def _post_init(app: Application):
     global SUBS, MY_HANDLES, TWITTER_BLACKLIST
     SUBS = _load_subs_from_file()
@@ -1493,6 +1585,7 @@ application.add_handler(CommandHandler("mirror", cmd_mirror))
 application.add_handler(CommandHandler("scrape", cmd_scrape))
 application.add_handler(CommandHandler("clearcache", cmd_clearcache))
 application.add_handler(CommandHandler("blacklist", cmd_blacklist))
+application.add_handler(CommandHandler("testreaders", cmd_testreaders))
 
 app = FastAPI(title="Telegram Webhook")
 app.add_middleware(GZipMiddleware, minimum_size=512)
