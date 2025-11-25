@@ -78,6 +78,7 @@ SUBS_FILE        = _p("SUBS_FILE",       "/tmp/telegram-bot/subscribers.txt")
 FIRST_SEEN_FILE  = _p("FIRST_SEEN_FILE", "/tmp/telegram-bot/first_seen_caps.json")
 FALLBACK_LOGO    = _p("FALLBACK_LOGO",   "/tmp/telegram-bot/solana_fallback.png")
 MY_FOLLOWING_TXT = _p("MY_FOLLOWING_TXT","/home/user/telegram-bot/handles.partial.txt")
+TWITTER_BLACKLIST_TXT = _p("TWITTER_BLACKLIST_TXT","/home/user/telegram-bot/twitter_blacklist.txt")
 FOLLOWERS_CACHE_DIR = pathlib.Path(_p("FOLLOWERS_CACHE_DIR", "/tmp/telegram-bot/followers_cache"))
 FB_STATIC_DIR       = pathlib.Path(_p("FB_STATIC_DIR",       "/tmp/telegram-bot/followers_static"))
 MIRROR_JSON         = _p("MIRROR_JSON", "/tmp/telegram-bot/mirror.json")
@@ -96,7 +97,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Reader services for bypassing IP blocks
+# Reader services for bypassing IP blocks (proven working services only)
 READER_SERVICES = [
     {"name": "Jina", "url": "https://r.jina.ai/", "prefix": True},
     {"name": "Txtify", "url": "https://txtify.it/", "prefix": True},
@@ -112,14 +113,16 @@ BACKGROUND_TASKS: Set[asyncio.Task] = set()
 
 class TwitterPatternMatcher:
     def __init__(self):
-        self.username_patterns = [
-            re.compile(r'@([A-Za-z0-9_]{1,15})\b'),
-            re.compile(r'(?:twitter|x)\.com/([A-Za-z0-9_]{1,15})(?:/|$|\?)', re.I),
-            re.compile(r'\(@([A-Za-z0-9_]+)\)\s+on\s+(?:X|Twitter)', re.I),
-            re.compile(r'Posted\s+by\s+@?([A-Za-z0-9_]+)', re.I),
-            re.compile(r'^@?([A-Za-z0-9_]+)\s*[:\-]', re.M),
+        # HIGH-VALUE PATTERNS ONLY (posters, moderators, retweeters)
+        self.high_value_patterns = [
+            re.compile(r'Posted\s+by\s+@?([A-Za-z0-9_]+)', re.I),           # Posters
+            re.compile(r'Moderator[s]?\s*:?\s*@?([A-Za-z0-9_]+)', re.I),    # Moderators
+            re.compile(r'\bRT\s+@([A-Za-z0-9_]+)', re.I),                   # Retweets
+            re.compile(r'^@([A-Za-z0-9_]+)\s*:', re.M),                     # Line start (posters)
         ]
+        
         self.blacklist = {
+            # Generic terms
             'twitter', 'x', 'i', 'home', 'explore', 'search', 'status', 'web', 
             'notifications', 'messages', 'settings', 'profile', 'lists', 'bookmarks',
             'community', 'communities', 'trending', 'moments',
@@ -136,18 +139,46 @@ class TwitterPatternMatcher:
             'month', 'day', 'hour', 'minute', 'second',
             'one', 'two', 'three', 'all', 'none', 'other', 'new', 'old', 'latest',
             'api', 'url', 'link', 'https', 'http', 'www', 'com', 'net', 'org',
+            # User-requested additions
+            'ca', 'conversation',
         }
     
+    def _is_valid_username(self, username: str) -> bool:
+        """Check if username is valid (not blacklisted, not all-numbers, not one-letter)"""
+        username = username.lower()
+        
+        # Blacklist check
+        if username in self.blacklist:
+            return False
+        
+        # Length check
+        if len(username) < 1 or len(username) > 15:
+            return False
+        
+        # Must be alphanumeric with underscores
+        if not username.replace('_', '').isalnum():
+            return False
+        
+        # Reject one-letter usernames (e.g., @a, @x, @z)
+        if len(username) == 1:
+            return False
+        
+        # Reject all-numbers usernames (e.g., @123, @456789)
+        if username.replace('_', '').isdigit():
+            return False
+        
+        return True
+    
     def extract_usernames(self, text: str) -> Set[str]:
+        """Extract HIGH-VALUE usernames only (posters, moderators, retweeters)"""
         usernames = set()
-        for pattern in self.username_patterns:
+        
+        for pattern in self.high_value_patterns:
             for match in pattern.finditer(text):
                 username = match.group(1).lower()
-                if (username not in self.blacklist and 
-                    len(username) <= 15 and 
-                    len(username) >= 1 and 
-                    username.replace('_', '').isalnum()):
+                if self._is_valid_username(username):
                     usernames.add(username)
+        
         return usernames
 
 class URLVariantGenerator:
@@ -256,39 +287,61 @@ class TwitterScraper:
                 clean_url = url.replace('https://', '').replace('http://', '')
                 fetch_url = service['url'] + clean_url
             else:
-                fetch_url = url
+                fetch_url = service['url'] + url
             
             actual_timeout = timeout or TWITTER_SCRAPE_TIMEOUT
             response = SESSION.get(fetch_url, headers=HEADERS, timeout=actual_timeout)
+            
             if response.status_code == 200 and len(response.text) > 500:
-                log.info(f"[Twitter] {service['name']} OK: {len(response.text):,} chars")
+                log.info(f"[Twitter] ✅ {service['name']} SUCCESS: {len(response.text):,} chars")
                 return response.text
+            else:
+                log.warning(f"[Twitter] ❌ {service['name']} FAILED: Status {response.status_code}, {len(response.text)} chars")
+                return None
+                
+        except requests.exceptions.Timeout:
+            log.warning(f"[Twitter] ❌ {service['name']} TIMEOUT after {actual_timeout}s")
+        except requests.exceptions.ConnectionError as e:
+            log.warning(f"[Twitter] ❌ {service['name']} CONNECTION ERROR: {str(e)[:100]}")
         except Exception as e:
-            log.debug(f"[Twitter] {service['name']} failed: {e}")
+            log.warning(f"[Twitter] ❌ {service['name']} ERROR: {type(e).__name__}: {str(e)[:100]}")
         return None
     
     def _fetch_readable(self, url: str, timeout: int = None, preferred_service: int = None) -> Optional[str]:
+        log.info(f"[Twitter] Attempting to fetch: {url[:80]}...")
+        
         if preferred_service is not None and 0 <= preferred_service < len(READER_SERVICES):
             service = READER_SERVICES[preferred_service]
+            log.info(f"[Twitter] Trying PREFERRED service: {service['name']}")
             result = self._try_service(url, service, timeout)
             if result:
                 self.successful_service = service
                 return result
         
         if self.successful_service:
+            log.info(f"[Twitter] Trying LAST SUCCESSFUL service: {self.successful_service['name']}")
             result = self._try_service(url, self.successful_service, timeout)
             if result:
                 return result
+            else:
+                log.warning(f"[Twitter] Last successful service {self.successful_service['name']} failed, trying others...")
         
+        log.info(f"[Twitter] Rotating through all {len(READER_SERVICES)} services...")
         for i, service in enumerate(READER_SERVICES):
             if preferred_service == i:
                 continue
+            
+            log.info(f"[Twitter] [{i+1}/{len(READER_SERVICES)}] Trying: {service['name']}")
             result = self._try_service(url, service, timeout)
+            
             if result:
                 self.successful_service = service
+                log.info(f"[Twitter] ✅ {service['name']} succeeded! Will use this service first next time.")
                 return result
+            
             time.sleep(0.3)
         
+        log.error(f"[Twitter] ❌ ALL {len(READER_SERVICES)} services failed for: {url[:80]}")
         return None
     
     def scrape_url(self, url: str, use_cache: bool = True, timeout: int = None, preferred_service: int = None) -> Set[str]:
@@ -300,17 +353,28 @@ class TwitterScraper:
             if cached is not None:
                 return cached
         
-        log.info(f"[Twitter] Scraping: {url} (timeout={timeout or TWITTER_SCRAPE_TIMEOUT}s, service={preferred_service})")
+        log.info(f"[Twitter] 🔍 Starting scrape: {url}")
+        log.info(f"[Twitter] Config: timeout={timeout or TWITTER_SCRAPE_TIMEOUT}s, preferred_service={preferred_service}, available_services={len(READER_SERVICES)}")
+        
         variants = self.url_generator.generate(url)
         all_usernames = set()
+        services_tried = []
         
         for i, variant in enumerate(variants):
+            log.info(f"[Twitter] Trying variant {i+1}/{len(variants)}: {variant}")
             content = self._fetch_readable(variant, timeout=timeout, preferred_service=preferred_service)
+            
             if content:
                 usernames = self.matcher.extract_usernames(content)
+                log.info(f"[Twitter] ✅ Extracted {len(usernames)} usernames from variant {i+1}")
                 all_usernames.update(usernames)
+                
                 if len(all_usernames) >= TWITTER_MAX_USERNAMES:
+                    log.info(f"[Twitter] Reached max usernames ({TWITTER_MAX_USERNAMES}), stopping")
                     break
+            else:
+                log.warning(f"[Twitter] ❌ No content retrieved from variant {i+1}")
+            
             if i < len(variants) - 1:
                 time.sleep(0.5)
         
@@ -318,8 +382,10 @@ class TwitterScraper:
             cache_key = self._get_cache_key(url)
             self.cache[cache_key] = {'usernames': sorted(all_usernames), 'timestamp': time.time()}
             self._save_cache()
+            log.info(f"[Twitter] ✅ SUCCESS: Found {len(all_usernames)} unique usernames, cached as '{cache_key}'")
+        else:
+            log.error(f"[Twitter] ❌ FAILED: No usernames found after trying {len(variants)} variants with {len(READER_SERVICES)} services")
         
-        log.info(f"[Twitter] Found: {len(all_usernames)} usernames")
         return all_usernames
 
 twitter_scraper = TwitterScraper()
@@ -698,59 +764,98 @@ def load_my_following() -> Set[str]:
 
 MY_HANDLES: Set[str] = load_my_following()
 
+def load_twitter_blacklist() -> Set[str]:
+    """Load blacklisted Twitter usernames from file"""
+    p = pathlib.Path(TWITTER_BLACKLIST_TXT)
+    if not p.exists():
+        # Create empty blacklist file with instructions
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                "# Twitter Username Blacklist\n"
+                "# One username per line (without @)\n"
+                "# Lines starting with # are comments\n"
+                "# Example:\n"
+                "# spambot123\n"
+                "# generic_user\n"
+            )
+            log.info(f"[Blacklist] Created empty blacklist file: {TWITTER_BLACKLIST_TXT}")
+        except Exception as e:
+            log.warning(f"[Blacklist] Could not create file: {e}")
+        return set()
+    
+    out = set()
+    try:
+        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            # Skip empty lines and comments
+            if not line or line.startswith("#"):
+                continue
+            h = _normalize_handle(line)
+            if h:
+                out.add(h)
+        log.info(f"[Blacklist] Loaded {len(out)} blacklisted usernames")
+    except Exception as e:
+        log.warning(f"[Blacklist] Load failed: {e}")
+    return out
+
+TWITTER_BLACKLIST: Set[str] = load_twitter_blacklist()
+
+def _save_blacklist_to_file():
+    """Save blacklist to file"""
+    try:
+        p = pathlib.Path(TWITTER_BLACKLIST_TXT)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        
+        lines = [
+            "# Twitter Username Blacklist",
+            "# Managed by bot - edit via /blacklist commands",
+            "# Or edit this file manually and restart bot",
+            ""
+        ]
+        lines.extend(sorted(TWITTER_BLACKLIST))
+        
+        p.write_text("\n".join(lines))
+        log.info(f"[Blacklist] Saved {len(TWITTER_BLACKLIST)} usernames to file")
+    except Exception as e:
+        log.error(f"[Blacklist] Save failed: {e}")
+
 def format_twitter_overlap(usernames: Set[str]) -> str:
     """
     Format Twitter accounts for display - Option A with 🎯 target emoji
-    Returns HTML-formatted links
+    Returns HTML-formatted links with NO character limit - shows ALL accounts
+    Filters out blacklisted usernames
     """
     if not usernames:
         return "—"
     
+    # Filter out blacklisted usernames
+    filtered_usernames = usernames - TWITTER_BLACKLIST
+    
+    if not filtered_usernames:
+        return "—"
+    
     if not MY_HANDLES:
-        acc, total = [], 0
-        for h in sorted(usernames):
-            piece = f'<a href="https://x.com/{h}">@{h}</a>, '
-            if total + len(piece) > 180:
-                break
-            acc.append(piece)
-            total += len(piece)
-        
-        result = "".join(acc).rstrip(", ")
-        if len(usernames) > len(acc):
-            result += f" , … (+{len(usernames) - len(acc)} more)"
-        return result
+        # No following list - show ALL non-blacklisted accounts
+        links = [f'<a href="https://x.com/{h}">@{h}</a>' for h in sorted(filtered_usernames)]
+        return ", ".join(links)
     
-    followed = sorted(MY_HANDLES & usernames)
-    not_followed = sorted(usernames - MY_HANDLES)
+    # Split into followed (🎯) and not followed
+    followed = sorted(MY_HANDLES & filtered_usernames)
+    not_followed = sorted(filtered_usernames - MY_HANDLES)
     
-    acc, total = [], 0
-    accounts_shown = 0
+    # Build complete list: followed first with 🎯, then others
+    all_links = []
     
-    # Followed accounts with 🎯 and HTML links
+    # Add followed accounts with 🎯
     for h in followed:
-        piece = f'<a href="https://x.com/{h}">@{h}</a> 🎯, '
-        if total + len(piece) > 180:
-            break
-        acc.append(piece)
-        total += len(piece)
-        accounts_shown += 1
+        all_links.append(f'<a href="https://x.com/{h}">@{h}</a> 🎯')
     
-    # Non-followed accounts with HTML links
+    # Add non-followed accounts
     for h in not_followed:
-        piece = f'<a href="https://x.com/{h}">@{h}</a>, '
-        if total + len(piece) > 180:
-            break
-        acc.append(piece)
-        total += len(piece)
-        accounts_shown += 1
+        all_links.append(f'<a href="https://x.com/{h}">@{h}</a>')
     
-    result = "".join(acc).rstrip(", ")
-    
-    if accounts_shown < len(usernames):
-        remaining = len(usernames) - accounts_shown
-        result += f" , … (+{remaining} more)"
-    
-    return result
+    return ", ".join(all_links)
 
 async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, token_name: str):
     """
@@ -758,6 +863,11 @@ async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, t
     Store results in FIRST_SEEN for use in price updates
     """
     try:
+        # Double-check if already scraped (race condition protection)
+        if token in FIRST_SEEN and FIRST_SEEN[token].get("tw_scraped", False):
+            log.info(f"[Twitter-Auto] Skipping {token_name} - already scraped")
+            return
+        
         log.info(f"[Twitter-Auto] Starting auto-scrape for {token_name} ({token})")
         
         # Send initial "scraping..." message
@@ -800,8 +910,14 @@ async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, t
                 FIRST_SEEN[token]["tw_overlap"] = overlap_text
                 FIRST_SEEN[token]["tw_scraped"] = True
                 FIRST_SEEN[token]["tw_scraped_at"] = int(time.time())
+                
+                # FORCE SAVE AND VERIFY
                 _save_first_seen(FIRST_SEEN)
-                log.info(f"[Twitter-Auto] ✓ Stored overlap for {token}: {overlap_text[:50]}...")
+                test_load = _load_first_seen()
+                if test_load.get(token, {}).get("tw_overlap") == overlap_text:
+                    log.info(f"[Twitter-Auto] ✓ SAVED & VERIFIED: {token} - {len(usernames)} accounts")
+                else:
+                    log.error(f"[Twitter-Auto] ✗ SAVE VERIFICATION FAILED for {token}!")
             else:
                 log.warning(f"[Twitter-Auto] Token {token} not in FIRST_SEEN, cannot store overlap")
             
@@ -826,14 +942,17 @@ async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, t
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=scrape_msg.message_id,
-                text="⚠️ No usernames found. This could mean:\n"
-                     "• Empty community/profile\n"
-                     "• Private account\n"
-                     "• Reader services blocked\n"
-                     "• Invalid URL format"
+                text="⚠️ No usernames found. Possible causes:\n\n"
+                     "• Empty/private community or profile\n"
+                     "• Reader services are blocked/rate limited\n"
+                     "• Twitter changed their format\n"
+                     "• Invalid URL\n\n"
+                     "Check bot logs for detailed error messages.\n"
+                     "Try manual: /scrape <url>"
             )
             
-            log.warning(f"[Twitter-Auto] No usernames found for {token}")
+            log.error(f"[Twitter-Auto] ❌ SCRAPE FAILED for {token}: No usernames found from {tw_url}")
+            log.error(f"[Twitter-Auto] Check if reader services are working or being rate limited")
             
     except Exception as e:
         log.exception(f"[Twitter-Auto] Auto-scrape failed for {token}: {e}")
@@ -970,11 +1089,15 @@ def passes_filters_for_alert(m: dict) -> bool:
 
 async def send_new_token(bot, chat_id: int, m: dict):
     """
-    Send new token alert immediately with "—" for Twitter
-    Trigger automatic separate scraping message in background
+    Send new token alert immediately
+    Trigger automatic separate scraping message in background (if not already scraped)
     """
-    # Send alert immediately with placeholder
-    fb_text = "—"
+    token = m.get("token")
+    
+    # Check if we already have stored Twitter data
+    record = FIRST_SEEN.get(token, {})
+    fb_text = record.get("tw_overlap", "—")
+    
     m["_is_update"] = False
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
@@ -991,14 +1114,16 @@ async def send_new_token(bot, chat_id: int, m: dict):
     if should_pin and msg_id:
         LAST_PINNED[key] = msg_id
     
-    # Trigger automatic scraping in background (separate message)
+    # Only scrape if NOT already scraped
     tw_url = m.get("tw_url")
-    if tw_url and TWITTER_SCRAPER_ENABLED and tw_url != "https://x.com/":
+    already_scraped = record.get("tw_scraped", False)
+    
+    if tw_url and TWITTER_SCRAPER_ENABLED and tw_url != "https://x.com/" and not already_scraped:
         task = asyncio.create_task(
             send_auto_scrape_message(
                 bot, 
                 chat_id, 
-                m["token"], 
+                token, 
                 tw_url, 
                 m.get("name", "Token")
             )
@@ -1008,18 +1133,28 @@ async def send_new_token(bot, chat_id: int, m: dict):
         task.add_done_callback(BACKGROUND_TASKS.discard)
         
         log.info(f"[Alert] Sent alert for {m.get('name')} + triggered auto-scrape")
+    elif already_scraped:
+        log.info(f"[Alert] Sent alert for {m.get('name')} (already scraped, showing stored data)")
     else:
         log.info(f"[Alert] Sent alert for {m.get('name')} (no Twitter URL to scrape)")
 
 async def send_price_update(bot, chat_id: int, m: dict):
     """
-    Send price update - uses stored Twitter overlap from auto-scrape
+    Send price update - uses stored Twitter overlap from m dict OR FIRST_SEEN
     """
     token = m.get("token")
-    record = FIRST_SEEN.get(token, {})
     
-    # Use stored overlap from automatic scraping
-    fb_text = record.get("tw_overlap", "—")
+    # Try to get from m dict first (passed from updater), fallback to FIRST_SEEN
+    fb_text = m.get("tw_overlap")
+    if not fb_text or fb_text == "—":
+        record = FIRST_SEEN.get(token, {})
+        fb_text = record.get("tw_overlap", "—")
+    
+    # Debug logging
+    if fb_text != "—":
+        log.info(f"[Update] {m.get('name')} - Using Twitter data: {len(fb_text)} chars")
+    else:
+        log.warning(f"[Update] {m.get('name')} - No Twitter data available")
     
     m["_is_update"] = True
     caption = build_caption(m, fb_text, is_update=True)
@@ -1058,9 +1193,14 @@ async def auto_trade(context: ContextTypes.DEFAULT_TYPE):
     await do_trade_push(context.bot)
 
 async def updater(context: ContextTypes.DEFAULT_TYPE):
+    global FIRST_SEEN
     log.info(f"🧊 [tick] updater fired (interval={UPDATE_INTERVAL_SEC}s)")
     try:
         if not TRACKED: return
+        
+        # Reload FIRST_SEEN to get latest scraped data
+        FIRST_SEEN = _load_first_seen()
+        
         now_ts=int(time.time())
         log.info(f"[updater] refreshing {len(TRACKED)} tracked tokens")
         for token in list(TRACKED):
@@ -1099,6 +1239,10 @@ async def updater(context: ContextTypes.DEFAULT_TYPE):
                 "axiom": AXIOM_WEB_URL.format(pair=cur.get("pairAddress") or "") if cur.get("pairAddress") else "https://axiom.trade/",
                 "gmgn": GMGN_WEB_URL.format(mint=token) if token else "https://gmgn.ai/",
             }
+            
+            # CRITICAL: Add stored Twitter overlap to update dict!
+            m["tw_overlap"] = first_rec.get("tw_overlap", "—")
+            
             if float(m.get("age_min", 1e9)) >= MAX_AGE_MIN:
                 TRACKED.discard(token); continue
             m["first_mcap_usd"] = float(first_rec.get("first", 0.0))
@@ -1121,12 +1265,14 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"✅ Subscribed!\n\n"
         f"🔥 New tokens every {TRADE_SUMMARY_SEC}s\n"
         f"🧊 Price updates every {UPDATE_INTERVAL_SEC}s\n"
-        f"🐦 Twitter scraper: {'Enabled (Hybrid mode)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n"
-        f"⏱️ Quick attempt: 60s, then retries up to 5min\n\n"
+        f"🐦 Twitter scraper: {'Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n\n"
         f"Commands:\n"
         f"/status - Bot stats\n"
         f"/trade [N] - Show N tokens\n"
-        f"/scrape <url> - Manually scrape Twitter URL"
+        f"/scrape <url> - Manually scrape Twitter\n"
+        f"/blacklist - Manage username blacklist\n"
+        f"/blacklist add username - Block a user\n"
+        f"/blacklist remove username - Unblock a user"
     )
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1153,6 +1299,7 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Tracked tokens: {len(TRACKED)}\n"
         f"Mirror tokens: {s['tokens']}\n"
         f"Following: {len(MY_HANDLES)} handles\n"
+        f"Blacklisted: {len(TWITTER_BLACKLIST)} usernames\n"
         f"Twitter cache: {cache_size} entries\n"
         f"Active scrape tasks: {len(BACKGROUND_TASKS)}\n"
         f"Scraper: {'✅ Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else '❌ Disabled'}"
@@ -1261,16 +1408,166 @@ async def cmd_clearcache(u: Update, c: ContextTypes.DEFAULT_TYPE):
     twitter_scraper._save_cache()
     await u.message.reply_text(f"🗑️ Cleared {count} cached Twitter results")
 
+async def cmd_blacklist(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Manage Twitter blacklist"""
+    global TWITTER_BLACKLIST
+    args = (u.message.text or "").split()
+    
+    # /blacklist - show current list
+    if len(args) == 1:
+        if not TWITTER_BLACKLIST:
+            await u.message.reply_text(
+                "🚫 Blacklist is empty\n\n"
+                "Usage:\n"
+                "/blacklist add username\n"
+                "/blacklist remove username\n"
+                "/blacklist clear"
+            )
+        else:
+            blacklist_str = ", ".join(f"@{h}" for h in sorted(TWITTER_BLACKLIST)[:50])
+            if len(TWITTER_BLACKLIST) > 50:
+                blacklist_str += f" ... +{len(TWITTER_BLACKLIST) - 50} more"
+            await u.message.reply_text(
+                f"🚫 Blacklisted ({len(TWITTER_BLACKLIST)}):\n\n"
+                f"{blacklist_str}\n\n"
+                f"Commands:\n"
+                f"/blacklist add username\n"
+                f"/blacklist remove username\n"
+                f"/blacklist clear"
+            )
+        return
+    
+    command = args[1].lower()
+    
+    # /blacklist add username
+    if command == "add":
+        if len(args) < 3:
+            await u.message.reply_text("Usage: /blacklist add username")
+            return
+        
+        username = _normalize_handle(args[2])
+        if not username:
+            await u.message.reply_text("❌ Invalid username")
+            return
+        
+        if username in TWITTER_BLACKLIST:
+            await u.message.reply_text(f"⚠️ @{username} is already blacklisted")
+            return
+        
+        TWITTER_BLACKLIST.add(username)
+        _save_blacklist_to_file()
+        
+        await u.message.reply_text(
+            f"✅ Added to blacklist: @{username}\n"
+            f"Total: {len(TWITTER_BLACKLIST)}"
+        )
+    
+    # /blacklist remove username
+    elif command == "remove":
+        if len(args) < 3:
+            await u.message.reply_text("Usage: /blacklist remove username")
+            return
+        
+        username = _normalize_handle(args[2])
+        if not username:
+            await u.message.reply_text("❌ Invalid username")
+            return
+        
+        if username not in TWITTER_BLACKLIST:
+            await u.message.reply_text(f"⚠️ @{username} is not in blacklist")
+            return
+        
+        TWITTER_BLACKLIST.remove(username)
+        _save_blacklist_to_file()
+        
+        await u.message.reply_text(
+            f"✅ Removed from blacklist: @{username}\n"
+            f"Total: {len(TWITTER_BLACKLIST)}"
+        )
+    
+    # /blacklist clear
+    elif command == "clear":
+        if not TWITTER_BLACKLIST:
+            await u.message.reply_text("Blacklist is already empty")
+            return
+        
+        count = len(TWITTER_BLACKLIST)
+        TWITTER_BLACKLIST.clear()
+        _save_blacklist_to_file()
+        
+        await u.message.reply_text(f"🗑️ Cleared {count} usernames from blacklist")
+    
+    else:
+        await u.message.reply_text(
+            "Usage:\n"
+            "/blacklist - View list\n"
+            "/blacklist add username\n"
+            "/blacklist remove username\n"
+            "/blacklist clear"
+        )
+
+async def cmd_testreaders(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Test which reader services are working"""
+    await u.message.reply_text("🔍 Testing all reader services...\n⏳ This will take ~30 seconds")
+    
+    test_url = "https://x.com/elonmusk"
+    results = []
+    
+    for i, service in enumerate(READER_SERVICES):
+        try:
+            log.info(f"[Test] Testing service {i+1}/{len(READER_SERVICES)}: {service['name']}")
+            
+            if service.get('prefix', True):
+                clean_url = test_url.replace('https://', '')
+                fetch_url = service['url'] + clean_url
+            else:
+                fetch_url = service['url'] + test_url
+            
+            response = SESSION.get(fetch_url, headers=HEADERS, timeout=10)
+            
+            if response.status_code == 200 and len(response.text) > 500:
+                results.append(f"✅ {service['name']}: Working ({len(response.text):,} chars)")
+                log.info(f"[Test] ✅ {service['name']} PASSED")
+            else:
+                results.append(f"❌ {service['name']}: Status {response.status_code}, {len(response.text)} chars")
+                log.warning(f"[Test] ❌ {service['name']} FAILED: {response.status_code}")
+                
+        except requests.exceptions.Timeout:
+            results.append(f"⏱️ {service['name']}: Timeout (>10s)")
+            log.warning(f"[Test] ⏱️ {service['name']} TIMEOUT")
+        except Exception as e:
+            results.append(f"❌ {service['name']}: {type(e).__name__}")
+            log.warning(f"[Test] ❌ {service['name']} ERROR: {e}")
+        
+        time.sleep(1)  # Be nice, don't hammer
+    
+    working = sum(1 for r in results if r.startswith("✅"))
+    
+    message = (
+        f"📊 Reader Services Test Results\n"
+        f"Test URL: {test_url}\n\n"
+        + "\n".join(results) +
+        f"\n\n✅ Working: {working}/{len(READER_SERVICES)}\n"
+        f"❌ Failed: {len(READER_SERVICES) - working}/{len(READER_SERVICES)}"
+    )
+    
+    if working == 0:
+        message += "\n\n⚠️ ALL SERVICES FAILED!\nPossible causes:\n• Rate limited\n• IP blocked\n• Services down"
+    
+    await u.message.reply_text(message)
+
 async def _post_init(app: Application):
-    global SUBS, MY_HANDLES
+    global SUBS, MY_HANDLES, TWITTER_BLACKLIST
     SUBS = _load_subs_from_file()
     MY_HANDLES = load_my_following()
+    TWITTER_BLACKLIST = load_twitter_blacklist()
     if ALERT_CHAT_ID:
         SUBS.add(ALERT_CHAT_ID)
         _save_subs_to_file()
     await _validate_subs(app.bot)
     log.info(f"Subscribers: {sorted(SUBS)}")
     log.info(f"Following: {len(MY_HANDLES)} handles")
+    log.info(f"Blacklist: {len(TWITTER_BLACKLIST)} usernames")
     log.info(f"Twitter scraper: {'Enabled (Auto separate messages mode)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
@@ -1283,6 +1580,8 @@ application.add_handler(CommandHandler("trade", cmd_trade))
 application.add_handler(CommandHandler("mirror", cmd_mirror))
 application.add_handler(CommandHandler("scrape", cmd_scrape))
 application.add_handler(CommandHandler("clearcache", cmd_clearcache))
+application.add_handler(CommandHandler("blacklist", cmd_blacklist))
+application.add_handler(CommandHandler("testreaders", cmd_testreaders))
 
 app = FastAPI(title="Telegram Webhook")
 app.add_middleware(GZipMiddleware, minimum_size=512)
@@ -1302,11 +1601,12 @@ async def healthz():
 
 @app.on_event("startup")
 async def _startup():
-    global SUBS, FIRST_SEEN, MIRROR, MY_HANDLES
+    global SUBS, FIRST_SEEN, MIRROR, MY_HANDLES, TWITTER_BLACKLIST
     SUBS = _load_subs_from_file()
     FIRST_SEEN = _load_first_seen()
     MIRROR = _mirror_load()
     MY_HANDLES = load_my_following()
+    TWITTER_BLACKLIST = load_twitter_blacklist()
     asyncio.create_task(_start_bot_and_jobs())
 
 async def _start_bot_and_jobs():
