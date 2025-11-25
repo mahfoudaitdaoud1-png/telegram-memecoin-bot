@@ -113,12 +113,13 @@ BACKGROUND_TASKS: Set[asyncio.Task] = set()
 
 class TwitterPatternMatcher:
     def __init__(self):
-        # HIGH-VALUE PATTERNS ONLY (posters, moderators, retweeters)
-        self.high_value_patterns = [
-            re.compile(r'Posted\s+by\s+@?([A-Za-z0-9_]+)', re.I),           # Posters
-            re.compile(r'Moderator[s]?\s*:?\s*@?([A-Za-z0-9_]+)', re.I),    # Moderators
-            re.compile(r'\bRT\s+@([A-Za-z0-9_]+)', re.I),                   # Retweets
-            re.compile(r'^@([A-Za-z0-9_]+)\s*:', re.M),                     # Line start (posters)
+        # BROAD patterns to catch all usernames (from functioning version)
+        self.username_patterns = [
+            re.compile(r'@([A-Za-z0-9_]{1,15})\b'),
+            re.compile(r'(?:twitter|x)\.com/([A-Za-z0-9_]{1,15})(?:/|$|\?)', re.I),
+            re.compile(r'\(@([A-Za-z0-9_]+)\)\s+on\s+(?:X|Twitter)', re.I),
+            re.compile(r'Posted\s+by\s+@?([A-Za-z0-9_]+)', re.I),
+            re.compile(r'^@?([A-Za-z0-9_]+)\s*[:\-]', re.M),
         ]
         
         self.blacklist = {
@@ -143,40 +144,17 @@ class TwitterPatternMatcher:
             'ca', 'conversation',
         }
     
-    def _is_valid_username(self, username: str) -> bool:
-        """Check if username is valid (not blacklisted, not all-numbers, not one-letter)"""
-        username = username.lower()
-        
-        # Blacklist check
-        if username in self.blacklist:
-            return False
-        
-        # Length check
-        if len(username) < 1 or len(username) > 15:
-            return False
-        
-        # Must be alphanumeric with underscores
-        if not username.replace('_', '').isalnum():
-            return False
-        
-        # Reject one-letter usernames (e.g., @a, @x, @z)
-        if len(username) == 1:
-            return False
-        
-        # Reject all-numbers usernames (e.g., @123, @456789)
-        if username.replace('_', '').isdigit():
-            return False
-        
-        return True
-    
     def extract_usernames(self, text: str) -> Set[str]:
-        """Extract HIGH-VALUE usernames only (posters, moderators, retweeters)"""
+        """Extract valid Twitter usernames from text"""
         usernames = set()
         
-        for pattern in self.high_value_patterns:
+        for pattern in self.username_patterns:
             for match in pattern.finditer(text):
                 username = match.group(1).lower()
-                if self._is_valid_username(username):
+                if (username not in self.blacklist and 
+                    len(username) <= 15 and 
+                    len(username) >= 1 and 
+                    username.replace('_', '').isalnum()):
                     usernames.add(username)
         
         return usernames
