@@ -122,6 +122,7 @@ class TwitterPatternMatcher:
             re.compile(r'^@?([A-Za-z0-9_]+)\s*[:\-]', re.M),
         ]
         
+        # Hard-coded generic/system blacklist
         self.blacklist = {
             # Generic terms
             'twitter', 'x', 'i', 'home', 'explore', 'search', 'status', 'web', 
@@ -145,13 +146,16 @@ class TwitterPatternMatcher:
         }
     
     def extract_usernames(self, text: str) -> Set[str]:
-        """Extract valid Twitter usernames from text"""
+        """Extract valid Twitter usernames from text - applies BOTH blacklists"""
         usernames = set()
+        
+        # Combine hard-coded blacklist with user's dynamic blacklist
+        combined_blacklist = self.blacklist | TWITTER_BLACKLIST
         
         for pattern in self.username_patterns:
             for match in pattern.finditer(text):
                 username = match.group(1).lower()
-                if (username not in self.blacklist and 
+                if (username not in combined_blacklist and  # ← Now checks BOTH!
                     len(username) <= 15 and 
                     len(username) >= 1 and 
                     username.replace('_', '').isalnum()):
@@ -1435,9 +1439,14 @@ async def cmd_blacklist(u: Update, c: ContextTypes.DEFAULT_TYPE):
         TWITTER_BLACKLIST.add(username)
         _save_blacklist_to_file()
         
+        # Clear cache so future scrapes apply the blacklist
+        twitter_scraper.cache.clear()
+        twitter_scraper._save_cache()
+        
         await u.message.reply_text(
             f"✅ Added to blacklist: @{username}\n"
-            f"Total: {len(TWITTER_BLACKLIST)}"
+            f"Total: {len(TWITTER_BLACKLIST)}\n\n"
+            f"🗑️ Twitter cache cleared - new scrapes will exclude this user"
         )
     
     # /blacklist remove username
@@ -1458,9 +1467,14 @@ async def cmd_blacklist(u: Update, c: ContextTypes.DEFAULT_TYPE):
         TWITTER_BLACKLIST.remove(username)
         _save_blacklist_to_file()
         
+        # Clear cache so future scrapes include the user again
+        twitter_scraper.cache.clear()
+        twitter_scraper._save_cache()
+        
         await u.message.reply_text(
             f"✅ Removed from blacklist: @{username}\n"
-            f"Total: {len(TWITTER_BLACKLIST)}"
+            f"Total: {len(TWITTER_BLACKLIST)}\n\n"
+            f"🗑️ Twitter cache cleared - new scrapes will include this user"
         )
     
     # /blacklist clear
@@ -1473,7 +1487,14 @@ async def cmd_blacklist(u: Update, c: ContextTypes.DEFAULT_TYPE):
         TWITTER_BLACKLIST.clear()
         _save_blacklist_to_file()
         
-        await u.message.reply_text(f"🗑️ Cleared {count} usernames from blacklist")
+        # Clear cache
+        twitter_scraper.cache.clear()
+        twitter_scraper._save_cache()
+        
+        await u.message.reply_text(
+            f"🗑️ Cleared {count} usernames from blacklist\n"
+            f"🗑️ Twitter cache cleared"
+        )
     
     else:
         await u.message.reply_text(
