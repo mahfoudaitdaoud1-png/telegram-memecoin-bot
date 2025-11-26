@@ -76,6 +76,7 @@ def _p(env_name: str, default_path: str) -> str:
 
 SUBS_FILE        = _p("SUBS_FILE",       "/tmp/telegram-bot/subscribers.txt")
 FIRST_SEEN_FILE  = _p("FIRST_SEEN_FILE", "/tmp/telegram-bot/first_seen_caps.json")
+PINNED_MSGS_FILE = _p("PINNED_MSGS_FILE", "/tmp/telegram-bot/pinned_messages.json")
 FALLBACK_LOGO    = _p("FALLBACK_LOGO",   "/tmp/telegram-bot/solana_fallback.png")
 MY_FOLLOWING_TXT = _p("MY_FOLLOWING_TXT","/home/user/telegram-bot/handles.partial.txt")
 TWITTER_BLACKLIST_TXT = _p("TWITTER_BLACKLIST_TXT","/home/user/telegram-bot/twitter_blacklist.txt")
@@ -83,7 +84,7 @@ FOLLOWERS_CACHE_DIR = pathlib.Path(_p("FOLLOWERS_CACHE_DIR", "/tmp/telegram-bot/
 FB_STATIC_DIR       = pathlib.Path(_p("FB_STATIC_DIR",       "/tmp/telegram-bot/followers_static"))
 MIRROR_JSON         = _p("MIRROR_JSON", "/tmp/telegram-bot/mirror.json")
 
-for d in [pathlib.Path(SUBS_FILE).parent, pathlib.Path(FIRST_SEEN_FILE).parent, FOLLOWERS_CACHE_DIR, FB_STATIC_DIR, pathlib.Path(MIRROR_JSON).parent, pathlib.Path(TWITTER_CACHE_JSON).parent]:
+for d in [pathlib.Path(SUBS_FILE).parent, pathlib.Path(FIRST_SEEN_FILE).parent, pathlib.Path(PINNED_MSGS_FILE).parent, FOLLOWERS_CACHE_DIR, FB_STATIC_DIR, pathlib.Path(MIRROR_JSON).parent, pathlib.Path(TWITTER_CACHE_JSON).parent]:
     d.mkdir(parents=True, exist_ok=True)
 
 TW_BEARER = os.getenv("TW_BEARER", "").strip()
@@ -702,6 +703,75 @@ FIRST_SEEN = _load_first_seen()
 TRACKED: Set[str] = set()
 LAST_PINNED: Dict[Tuple[int, str], int] = {}
 
+# Pin management system
+MAX_PINS = 45  # Unpin when reaching this limit
+PINNED_MESSAGES: Dict[int, List[Dict]] = {}  # {chat_id: [{"msg_id": int, "timestamp": float, "token": str}]}
+
+def _load_pinned_messages() -> Dict[int, List[Dict]]:
+    """Load pinned messages tracking from file"""
+    p = pathlib.Path(PINNED_MSGS_FILE)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except:
+            return {}
+    return {}
+
+def _save_pinned_messages():
+    """Save pinned messages tracking to file"""
+    try:
+        pathlib.Path(PINNED_MSGS_FILE).write_text(json.dumps(PINNED_MESSAGES, indent=2))
+    except Exception as e:
+        log.error(f"Failed to save pinned messages: {e}")
+
+async def _unpin_oldest(bot, chat_id: int, count: int = 1):
+    """Unpin the oldest N pinned messages for a chat"""
+    if chat_id not in PINNED_MESSAGES or not PINNED_MESSAGES[chat_id]:
+        return
+    
+    pins = PINNED_MESSAGES[chat_id]
+    to_unpin = pins[:count]  # Get oldest N
+    
+    for pin_info in to_unpin:
+        try:
+            await bot.unpin_chat_message(chat_id, pin_info["msg_id"])
+            log.info(f"[Pin] Unpinned old message {pin_info['msg_id']} (token: {pin_info.get('token', 'unknown')})")
+        except Exception as e:
+            log.warning(f"[Pin] Failed to unpin {pin_info['msg_id']}: {e}")
+        
+        # Remove from tracking
+        pins.remove(pin_info)
+    
+    _save_pinned_messages()
+
+async def _track_and_pin(bot, chat_id: int, msg_id: int, token: str):
+    """Track and pin a message, unpinning oldest if near limit"""
+    if chat_id not in PINNED_MESSAGES:
+        PINNED_MESSAGES[chat_id] = []
+    
+    pins = PINNED_MESSAGES[chat_id]
+    
+    # Check if near limit
+    if len(pins) >= MAX_PINS:
+        log.info(f"[Pin] Near limit ({len(pins)}/{MAX_PINS}), unpinning oldest")
+        await _unpin_oldest(bot, chat_id, count=1)
+    
+    # Pin the message
+    try:
+        await bot.pin_chat_message(chat_id, msg_id, disable_notification=True)
+        
+        # Track the pin
+        pins.append({
+            "msg_id": msg_id,
+            "timestamp": time.time(),
+            "token": token
+        })
+        _save_pinned_messages()
+        
+        log.info(f"[Pin] Pinned message {msg_id} for token {token} ({len(pins)}/{MAX_PINS})")
+    except Exception as e:
+        log.warning(f"[Pin] Failed to pin message {msg_id}: {e}")
+
 def decorate_with_first_seen(pairs):
     changed=False; now_ts=int(time.time())
     for m in pairs:
@@ -714,7 +784,9 @@ def decorate_with_first_seen(pairs):
                 "first": (cur if cur>0 else 0.0), 
                 "ts": now_ts,
                 "tw_handle": m.get("tw_handle"),
-                "tw_url": m.get("tw_url")
+                "tw_url": m.get("tw_url"),
+                "tw_extraction_attempts": 0,  # NEW: Track retry attempts
+                "tw_extraction_last_try": now_ts,  # NEW: Track last attempt time
             }
             changed=True
         else:
@@ -725,6 +797,8 @@ def decorate_with_first_seen(pairs):
                 changed = True
             if not rec.get("tw_url") and m.get("tw_url"):
                 rec["tw_url"] = m.get("tw_url")
+                rec["tw_extraction_attempts"] = rec.get("tw_extraction_attempts", 0)
+                rec["tw_extraction_last_try"] = rec.get("tw_extraction_last_try", now_ts)
                 changed = True
         m["is_first_time"]=is_new
         m["first_mcap_usd"]=float(FIRST_SEEN.get(tok,{}).get("first",0))
@@ -944,6 +1018,102 @@ async def send_auto_scrape_message(bot, chat_id: int, token: str, tw_url: str, t
             FIRST_SEEN[token]["tw_scraped"] = True
             _save_first_seen(FIRST_SEEN)
 
+async def twitter_url_retry_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Background job that retries Twitter URL extraction for tokens where it failed
+    Runs every 2 minutes
+    """
+    try:
+        log.info("[URL-Retry] Starting Twitter URL retry check")
+        now_ts = int(time.time())
+        retry_count = 0
+        success_count = 0
+        
+        for token, record in list(FIRST_SEEN.items()):
+            # Skip if already has valid URL and scraped
+            tw_url = record.get("tw_url")
+            if tw_url and tw_url != "https://x.com/" and record.get("tw_scraped"):
+                continue
+            
+            # Skip if already maxed out attempts
+            attempts = record.get("tw_extraction_attempts", 0)
+            if attempts >= 4:
+                continue
+            
+            # Skip if token is too old (>30 minutes)
+            token_age = now_ts - record.get("ts", now_ts)
+            if token_age > 1800:  # 30 minutes
+                continue
+            
+            # Check if enough time passed since last attempt
+            last_try = record.get("tw_extraction_last_try", 0)
+            time_since_last = now_ts - last_try
+            
+            # Retry schedule: 2min, 5min, 10min
+            min_wait = 120  # 2 minutes default
+            if attempts == 1:
+                min_wait = 300  # 5 minutes for 2nd retry
+            elif attempts == 2:
+                min_wait = 600  # 10 minutes for 3rd retry
+            
+            if time_since_last < min_wait:
+                continue
+            
+            # Try to fetch fresh data and extract URL
+            retry_count += 1
+            log.info(f"[URL-Retry] Attempting retry {attempts + 1}/4 for token {token}")
+            
+            # Fetch fresh data from Dexscreener
+            fresh_data = _best_pool_for_mint(CHAIN_ID, token)
+            if not fresh_data:
+                log.warning(f"[URL-Retry] Could not fetch data for {token}")
+                record["tw_extraction_attempts"] = attempts + 1
+                record["tw_extraction_last_try"] = now_ts
+                _save_first_seen(FIRST_SEEN)
+                continue
+            
+            # Try to extract Twitter URL
+            info = fresh_data.get("info") or {}
+            x_handle, x_url = _extract_x(info)
+            
+            # Update attempt counter
+            record["tw_extraction_attempts"] = attempts + 1
+            record["tw_extraction_last_try"] = now_ts
+            
+            if x_url and x_url != "https://x.com/":
+                # SUCCESS! Found the URL
+                record["tw_url"] = x_url
+                record["tw_handle"] = x_handle
+                _save_first_seen(FIRST_SEEN)
+                
+                success_count += 1
+                log.info(f"[URL-Retry] ✅ SUCCESS! Found Twitter URL for {token}: {x_url} (attempt {attempts + 1})")
+                
+                # Trigger auto-scrape for this token
+                token_name = fresh_data.get("baseToken", {}).get("symbol") or "Unknown"
+                for chat_id in list(SUBS):
+                    task = asyncio.create_task(
+                        send_auto_scrape_message(
+                            context.bot,
+                            chat_id,
+                            token,
+                            x_url,
+                            token_name
+                        )
+                    )
+                    BACKGROUND_TASKS.add(task)
+                    task.add_done_callback(BACKGROUND_TASKS.discard)
+            else:
+                # Still no URL found
+                _save_first_seen(FIRST_SEEN)
+                log.warning(f"[URL-Retry] ❌ Still no URL for {token} (attempt {attempts + 1}/4)")
+        
+        if retry_count > 0:
+            log.info(f"[URL-Retry] Complete: {retry_count} retries attempted, {success_count} URLs found")
+        
+    except Exception as e:
+        log.exception(f"[URL-Retry] Error in retry job: {e}")
+
 # -----------------------------------------------------------------------------
 # Best token selection
 # -----------------------------------------------------------------------------
@@ -1090,11 +1260,13 @@ async def send_new_token(bot, chat_id: int, m: dict):
         bot, chat_id, caption, kb,
         token=m.get("token"),
         logo_hint=m.get("logo_hint"),
-        pin=should_pin
+        pin=False  # Don't pin directly here
     )
     
     if should_pin and msg_id:
         LAST_PINNED[key] = msg_id
+        # Use new pin tracking system
+        await _track_and_pin(bot, chat_id, msg_id, token)
     
     # Only scrape if NOT already scraped
     tw_url = m.get("tw_url")
@@ -1119,6 +1291,9 @@ async def send_new_token(bot, chat_id: int, m: dict):
         log.info(f"[Alert] Sent alert for {m.get('name')} (already scraped, showing stored data)")
     else:
         log.info(f"[Alert] Sent alert for {m.get('name')} (no Twitter URL to scrape)")
+        # Mark that we need URL retry
+        if token in FIRST_SEEN and not FIRST_SEEN[token].get("tw_url"):
+            log.info(f"[Alert] Token {token} will be checked by URL retry job")
 
 async def send_price_update(bot, chat_id: int, m: dict):
     """
@@ -1247,14 +1422,16 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"✅ Subscribed!\n\n"
         f"🔥 New tokens every {TRADE_SUMMARY_SEC}s\n"
         f"🧊 Price updates every {UPDATE_INTERVAL_SEC}s\n"
-        f"🐦 Twitter scraper: {'Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n\n"
+        f"🐦 Twitter scraper: {'Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n"
+        f"🔄 Twitter URL retry: Enabled (4 attempts over 17min)\n"
+        f"📌 Smart pin management: Auto-unpins when near limit\n\n"
         f"Commands:\n"
         f"/status - Bot stats\n"
         f"/trade [N] - Show N tokens\n"
         f"/scrape <url> - Manually scrape Twitter\n"
         f"/blacklist - Manage username blacklist\n"
-        f"/blacklist add username - Block a user\n"
-        f"/blacklist remove username - Unblock a user"
+        f"/clearpins - Unpin all tracked pins\n"
+        f"/testreaders - Test reader services"
     )
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1275,6 +1452,21 @@ async def cmd_unsub(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     s = mirror_stats()
     cache_size = len(twitter_scraper.cache)
+    chat_id = u.effective_chat.id
+    
+    # Count pins for this chat
+    pins_count = len(PINNED_MESSAGES.get(chat_id, []))
+    
+    # Count tokens awaiting URL retry
+    url_retry_pending = 0
+    for token, record in FIRST_SEEN.items():
+        tw_url = record.get("tw_url")
+        if not tw_url or tw_url == "https://x.com/":
+            attempts = record.get("tw_extraction_attempts", 0)
+            token_age = int(time.time()) - record.get("ts", 0)
+            if attempts < 4 and token_age < 1800:  # <30 min old
+                url_retry_pending += 1
+    
     await u.message.reply_text(
         f"📊 Bot Status\n\n"
         f"Subscribers: {len(SUBS)}\n"
@@ -1284,7 +1476,10 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Blacklisted: {len(TWITTER_BLACKLIST)} usernames\n"
         f"Twitter cache: {cache_size} entries\n"
         f"Active scrape tasks: {len(BACKGROUND_TASKS)}\n"
-        f"Scraper: {'✅ Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else '❌ Disabled'}"
+        f"Pinned messages: {pins_count}/{MAX_PINS}\n"
+        f"Pending URL retries: {url_retry_pending}\n"
+        f"Scraper: {'✅ Enabled (Auto)' if TWITTER_SCRAPER_ENABLED else '❌ Disabled'}\n"
+        f"URL Retry: ✅ Enabled (every 2min)"
     )
 
 async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1555,11 +1750,44 @@ async def cmd_testreaders(u: Update, c: ContextTypes.DEFAULT_TYPE):
     
     await u.message.reply_text(message)
 
+async def cmd_clearpins(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Unpin all tracked pinned messages in this chat"""
+    chat_id = u.effective_chat.id
+    
+    if chat_id not in PINNED_MESSAGES or not PINNED_MESSAGES[chat_id]:
+        await u.message.reply_text("📌 No pinned messages tracked in this chat")
+        return
+    
+    pins = PINNED_MESSAGES[chat_id].copy()
+    total = len(pins)
+    success = 0
+    failed = 0
+    
+    await u.message.reply_text(f"🗑️ Unpinning {total} messages...")
+    
+    for pin_info in pins:
+        try:
+            await c.bot.unpin_chat_message(chat_id, pin_info["msg_id"])
+            success += 1
+        except Exception as e:
+            log.warning(f"[Pin] Failed to unpin {pin_info['msg_id']}: {e}")
+            failed += 1
+    
+    # Clear tracking
+    PINNED_MESSAGES[chat_id] = []
+    _save_pinned_messages()
+    
+    await u.message.reply_text(
+        f"✅ Unpinned {success} messages\n"
+        f"{'❌ Failed: ' + str(failed) if failed > 0 else ''}"
+    )
+
 async def _post_init(app: Application):
-    global SUBS, MY_HANDLES, TWITTER_BLACKLIST
+    global SUBS, MY_HANDLES, TWITTER_BLACKLIST, PINNED_MESSAGES
     SUBS = _load_subs_from_file()
     MY_HANDLES = load_my_following()
     TWITTER_BLACKLIST = load_twitter_blacklist()
+    PINNED_MESSAGES = _load_pinned_messages()
     if ALERT_CHAT_ID:
         SUBS.add(ALERT_CHAT_ID)
         _save_subs_to_file()
@@ -1567,6 +1795,7 @@ async def _post_init(app: Application):
     log.info(f"Subscribers: {sorted(SUBS)}")
     log.info(f"Following: {len(MY_HANDLES)} handles")
     log.info(f"Blacklist: {len(TWITTER_BLACKLIST)} usernames")
+    log.info(f"Pinned messages: {sum(len(pins) for pins in PINNED_MESSAGES.values())} tracked")
     log.info(f"Twitter scraper: {'Enabled (Auto separate messages mode)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
@@ -1581,6 +1810,7 @@ application.add_handler(CommandHandler("scrape", cmd_scrape))
 application.add_handler(CommandHandler("clearcache", cmd_clearcache))
 application.add_handler(CommandHandler("blacklist", cmd_blacklist))
 application.add_handler(CommandHandler("testreaders", cmd_testreaders))
+application.add_handler(CommandHandler("clearpins", cmd_clearpins))
 
 app = FastAPI(title="Telegram Webhook")
 app.add_middleware(GZipMiddleware, minimum_size=512)
@@ -1600,12 +1830,13 @@ async def healthz():
 
 @app.on_event("startup")
 async def _startup():
-    global SUBS, FIRST_SEEN, MIRROR, MY_HANDLES, TWITTER_BLACKLIST
+    global SUBS, FIRST_SEEN, MIRROR, MY_HANDLES, TWITTER_BLACKLIST, PINNED_MESSAGES
     SUBS = _load_subs_from_file()
     FIRST_SEEN = _load_first_seen()
     MIRROR = _mirror_load()
     MY_HANDLES = load_my_following()
     TWITTER_BLACKLIST = load_twitter_blacklist()
+    PINNED_MESSAGES = _load_pinned_messages()
     asyncio.create_task(_start_bot_and_jobs())
 
 async def _start_bot_and_jobs():
@@ -1615,8 +1846,9 @@ async def _start_bot_and_jobs():
         jq.run_repeating(ingester, interval=timedelta(seconds=INGEST_INTERVAL_SEC), first=timedelta(seconds=2), name="ingester")
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
         jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
+        jq.run_repeating(twitter_url_retry_job, interval=timedelta(seconds=120), first=timedelta(seconds=60), name="url_retry")
         await application.start()
-        log.info("Bot initialized & started with Twitter Auto Separate Messages mode")
+        log.info("Bot initialized & started with Twitter Auto Separate Messages mode + URL Retry")
     except Exception as e:
         log.exception("Bot startup failed: %r", e)
 
