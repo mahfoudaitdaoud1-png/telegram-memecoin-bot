@@ -1212,11 +1212,23 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     if token and token in FIRST_SEEN:
         detection_ts = FIRST_SEEN[token].get("ts", 0)
         if detection_ts > 0:
-            seconds_ago = int(time.time() - detection_ts)
-            if seconds_ago < 60:
-                detected_ago = f" ({seconds_ago}s ago)"
-            elif seconds_ago < 3600:
-                detected_ago = f" ({seconds_ago // 60}m ago)"
+            try:
+                seconds_ago = int(time.time() - detection_ts)
+                if seconds_ago < 0:
+                    # Future timestamp = corrupted data
+                    detected_ago = ""
+                elif seconds_ago < 60:
+                    detected_ago = f" ({seconds_ago}s ago)"
+                elif seconds_ago < 3600:
+                    detected_ago = f" ({seconds_ago // 60}m ago)"
+                elif seconds_ago < 86400:
+                    detected_ago = f" ({seconds_ago // 3600}h ago)"
+                else:
+                    # More than 24h ago = too old, don't show
+                    detected_ago = ""
+            except Exception as e:
+                log.warning(f"[Caption] Timestamp calc error for {token[:8]}...: {e}")
+                detected_ago = ""
     
     return (
         f"{header}\n"
@@ -1838,7 +1850,7 @@ async def cmd_clearpins(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Reset all bot state for this chat - fresh start"""
-    global TRACKED, LAST_PINNED, BACKGROUND_TASKS
+    global TRACKED, LAST_PINNED, BACKGROUND_TASKS, FIRST_SEEN
     
     chat_id = u.effective_chat.id
     
@@ -1847,6 +1859,7 @@ async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "This will:\n"
         "• Unpin all tracked messages\n"
         "• Clear tracked tokens\n"
+        "• Clear FIRST_SEEN history\n"
         "• Clear Twitter cache\n"
         "• Clear pin history\n"
         "• Cancel pending scraping tasks\n"
@@ -1887,16 +1900,23 @@ async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
     tracked_count = len(TRACKED)
     TRACKED.clear()
     
-    # 5. Clear Twitter cache
+    # 5. Clear FIRST_SEEN completely (CRITICAL FIX!)
+    first_seen_count = len(FIRST_SEEN)
+    FIRST_SEEN.clear()
+    _save_first_seen(FIRST_SEEN)  # Save empty dict to file
+    log.info(f"[Reset] Cleared {first_seen_count} FIRST_SEEN entries (prevents retry job spam)")
+    
+    # 6. Clear Twitter cache
     cache_count = len(twitter_scraper.cache)
     twitter_scraper.cache.clear()
     twitter_scraper._save_cache()
     
-    # 6. Log the reset
+    # 7. Log the reset
     log.info(f"[Reset] User {chat_id} performed full reset:")
     log.info(f"  - Cancelled: {tasks_cancelled} background tasks")
     log.info(f"  - Unpinned: {unpinned} messages")
     log.info(f"  - Cleared: {tracked_count} tracked tokens")
+    log.info(f"  - Cleared: {first_seen_count} FIRST_SEEN entries")
     log.info(f"  - Cleared: {cache_count} Twitter cache entries")
     
     await u.message.reply_text(
@@ -1904,10 +1924,12 @@ async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"🚫 Cancelled: {tasks_cancelled} scraping tasks\n"
         f"📌 Unpinned: {unpinned} messages\n"
         f"🔍 Cleared: {tracked_count} tracked tokens\n"
+        f"🗃️ Cleared: {first_seen_count} token history\n"
         f"🐦 Cleared: {cache_count} Twitter cache entries\n"
         f"🗑️ Cleared: {len(keys_to_remove)} pin history entries\n\n"
         f"🎉 You now have a fresh start!\n"
-        f"New tokens will be detected and tracked normally."
+        f"New tokens will be detected and tracked normally.\n"
+        f"⚠️ Retry job will no longer process old tokens."
     )
 
 async def _post_init(app: Application):
