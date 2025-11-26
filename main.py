@@ -1785,7 +1785,7 @@ async def cmd_clearpins(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Reset all bot state for this chat - fresh start"""
-    global TRACKED, LAST_PINNED
+    global TRACKED, LAST_PINNED, BACKGROUND_TASKS
     
     chat_id = u.effective_chat.id
     
@@ -1796,11 +1796,21 @@ async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "• Clear tracked tokens\n"
         "• Clear Twitter cache\n"
         "• Clear pin history\n"
+        "• Cancel pending scraping tasks\n"
         "• Give you a fresh start\n\n"
         "⏳ Processing..."
     )
     
-    # 1. Unpin all messages for this chat
+    # 1. Cancel all background scraping tasks
+    tasks_cancelled = 0
+    if BACKGROUND_TASKS:
+        for task in list(BACKGROUND_TASKS):
+            if not task.done():
+                task.cancel()
+                tasks_cancelled += 1
+        BACKGROUND_TASKS.clear()
+    
+    # 2. Unpin all messages for this chat
     unpinned = 0
     if chat_id in PINNED_MESSAGES:
         pins = PINNED_MESSAGES[chat_id].copy()
@@ -1815,28 +1825,30 @@ async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
         PINNED_MESSAGES[chat_id] = []
         _save_pinned_messages()
     
-    # 2. Clear LAST_PINNED entries for this chat
+    # 3. Clear LAST_PINNED entries for this chat
     keys_to_remove = [key for key in LAST_PINNED if key[0] == chat_id]
     for key in keys_to_remove:
         del LAST_PINNED[key]
     
-    # 3. Clear all tracked tokens (affects all subscribers)
+    # 4. Clear all tracked tokens (affects all subscribers)
     tracked_count = len(TRACKED)
     TRACKED.clear()
     
-    # 4. Clear Twitter cache
+    # 5. Clear Twitter cache
     cache_count = len(twitter_scraper.cache)
     twitter_scraper.cache.clear()
     twitter_scraper._save_cache()
     
-    # 5. Log the reset
+    # 6. Log the reset
     log.info(f"[Reset] User {chat_id} performed full reset:")
+    log.info(f"  - Cancelled: {tasks_cancelled} background tasks")
     log.info(f"  - Unpinned: {unpinned} messages")
     log.info(f"  - Cleared: {tracked_count} tracked tokens")
     log.info(f"  - Cleared: {cache_count} Twitter cache entries")
     
     await u.message.reply_text(
         f"✅ Reset Complete!\n\n"
+        f"🚫 Cancelled: {tasks_cancelled} scraping tasks\n"
         f"📌 Unpinned: {unpinned} messages\n"
         f"🔍 Cleared: {tracked_count} tracked tokens\n"
         f"🐦 Cleared: {cache_count} Twitter cache entries\n"
