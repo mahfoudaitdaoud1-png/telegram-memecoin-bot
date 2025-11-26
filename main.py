@@ -8,6 +8,7 @@ Memecoin Detection Bot with Integrated Twitter Scraper
 - Automatic Twitter scraping with separate visible messages
 - Results stored and shown in price updates
 - Manual /scrape command for testing
+- LIVE price detection for accurate buy bot integration
 """
 
 from __future__ import annotations
@@ -703,21 +704,64 @@ TRACKED: Set[str] = set()
 LAST_PINNED: Dict[Tuple[int, str], int] = {}
 
 def decorate_with_first_seen(pairs):
+    """
+    Decorate pairs with first-seen data.
+    For NEW tokens: Fetch LIVE data from Dexscreener API at detection moment.
+    This ensures "first" price is the ACTUAL current market price (not stale mirror data).
+    Critical for buy bot integration - enables accurate order placement.
+    """
     changed=False; now_ts=int(time.time())
     for m in pairs:
         tok = m.get("token") or ""
         cur = float(m.get("mcap_usd") or 0)
         rec = FIRST_SEEN.get(tok)
         is_new = rec is None
+        
         if is_new:
-            FIRST_SEEN[tok] = {
-                "first": (cur if cur>0 else 0.0), 
-                "ts": now_ts,
-                "tw_handle": m.get("tw_handle"),
-                "tw_url": m.get("tw_url")
-            }
+            # NEW TOKEN: Fetch LIVE data at detection moment for accurate "first" price
+            log.info(f"[Detection] NEW token {tok[:8]}... detected! Fetching LIVE data...")
+            
+            # Fetch fresh data from Dexscreener API
+            fresh_data = _best_pool_for_mint(CHAIN_ID, tok)
+            
+            if fresh_data:
+                # Extract LIVE mcap from fresh data
+                fresh_fdv = fresh_data.get("fdv")
+                fresh_mcap = float(fresh_fdv if fresh_fdv is not None else (fresh_data.get("marketCap") or 0) or 0)
+                
+                # Extract LIVE price (critical for buy bot!)
+                fresh_price = _get_price_usd(fresh_data)
+                
+                # Extract fresh Twitter info if available
+                fresh_info = fresh_data.get("info") or {}
+                fresh_handle, fresh_url = _extract_x(fresh_info)
+                
+                # Use LIVE mcap as "first" (locked forever)
+                first_mcap = fresh_mcap if fresh_mcap > 0 else cur
+                
+                log.info(f"[Detection] LIVE mcap at detection: ${first_mcap:,.0f} (price: ${fresh_price:.8f})")
+                
+                FIRST_SEEN[tok] = {
+                    "first": first_mcap,  # LIVE mcap at detection moment
+                    "first_price": fresh_price,  # LIVE price for buy bot
+                    "ts": now_ts,
+                    "tw_handle": fresh_handle or m.get("tw_handle"),
+                    "tw_url": fresh_url or m.get("tw_url"),
+                }
+            else:
+                # Fallback: couldn't fetch fresh data, use current
+                log.warning(f"[Detection] Could not fetch fresh data for {tok[:8]}..., using mirror data")
+                FIRST_SEEN[tok] = {
+                    "first": (cur if cur>0 else 0.0), 
+                    "first_price": m.get("price_usd", 0.0),
+                    "ts": now_ts,
+                    "tw_handle": m.get("tw_handle"),
+                    "tw_url": m.get("tw_url"),
+                }
+            
             changed=True
         else:
+            # Existing token: update only if needed
             if rec.get("first",0)==0 and cur>0:
                 rec["first"]=cur; changed=True
             if not rec.get("tw_handle") and m.get("tw_handle"):
@@ -726,8 +770,10 @@ def decorate_with_first_seen(pairs):
             if not rec.get("tw_url") and m.get("tw_url"):
                 rec["tw_url"] = m.get("tw_url")
                 changed = True
+        
         m["is_first_time"]=is_new
         m["first_mcap_usd"]=float(FIRST_SEEN.get(tok,{}).get("first",0))
+    
     if changed: _save_first_seen(FIRST_SEEN)
 
 # -----------------------------------------------------------------------------
@@ -995,9 +1041,34 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     price = float(m.get("price_usd") or 0)
     header = f"{fire_or_ice} <b>{html_escape(m['name'])}</b>"
     price_line = f"💵 <b>Price:</b> " + (f"${price:.8f}" if price < 1 else f"${price:,.4f}")
+    
+    # Get detection timestamp to show how fresh the data is
+    token = m.get("token")
+    detected_ago = ""
+    if token and token in FIRST_SEEN:
+        detection_ts = FIRST_SEEN[token].get("ts", 0)
+        if detection_ts > 0:
+            try:
+                seconds_ago = int(time.time() - detection_ts)
+                if seconds_ago < 0:
+                    # Future timestamp = corrupted data
+                    detected_ago = ""
+                elif seconds_ago < 60:
+                    detected_ago = f" ({seconds_ago}s ago)"
+                elif seconds_ago < 3600:
+                    detected_ago = f" ({seconds_ago // 60}m ago)"
+                elif seconds_ago < 86400:
+                    detected_ago = f" ({seconds_ago // 3600}h ago)"
+                else:
+                    # More than 24h ago = too old, don't show
+                    detected_ago = ""
+            except Exception as e:
+                log.warning(f"[Caption] Timestamp calc error for {token[:8]}...: {e}")
+                detected_ago = ""
+    
     return (
         f"{header}\n"
-        f"{BANK} <b>First Mcap:</b> {BLUE} ${first:,.0f}\n"
+        f"{BANK} <b>First Mcap (LIVE):</b> {BLUE} ${first:,.0f}{detected_ago}\n"
         f"{BANK} <b>Current Mcap:</b> {circle} ${cur:,.0f} <b>({pct})</b>\n"
         f"🖨️ <b>Mint:</b>\n<code>{html_escape(m['token'])}</code>\n"
         f"🔗 <b>Pair:</b>\n<code>{html_escape(m['pair'])}</code>\n"
@@ -1247,7 +1318,8 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"✅ Subscribed!\n\n"
         f"🔥 New tokens every {TRADE_SUMMARY_SEC}s\n"
         f"🧊 Price updates every {UPDATE_INTERVAL_SEC}s\n"
-        f"🐦 Twitter scraper: {'Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n\n"
+        f"🐦 Twitter scraper: {'Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n"
+        f"💰 LIVE price detection: Enabled (for accurate buy bot integration)\n\n"
         f"Commands:\n"
         f"/status - Bot stats\n"
         f"/trade [N] - Show N tokens\n"
@@ -1284,7 +1356,8 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Blacklisted: {len(TWITTER_BLACKLIST)} usernames\n"
         f"Twitter cache: {cache_size} entries\n"
         f"Active scrape tasks: {len(BACKGROUND_TASKS)}\n"
-        f"Scraper: {'✅ Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else '❌ Disabled'}"
+        f"Scraper: {'✅ Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else '❌ Disabled'}\n"
+        f"Price detection: ✅ LIVE (accurate for buy bot)"
     )
 
 async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1568,6 +1641,7 @@ async def _post_init(app: Application):
     log.info(f"Following: {len(MY_HANDLES)} handles")
     log.info(f"Blacklist: {len(TWITTER_BLACKLIST)} usernames")
     log.info(f"Twitter scraper: {'Enabled (Auto separate messages mode)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
+    log.info(f"Price detection: LIVE mode (accurate for buy bot integration)")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
 application.add_handler(CommandHandler("start", cmd_start))
@@ -1591,6 +1665,7 @@ async def health_root():
         "ok": True, 
         "twitter_scraper": TWITTER_SCRAPER_ENABLED, 
         "mode": "auto_separate_messages",
+        "price_detection": "LIVE",
         "active_tasks": len(BACKGROUND_TASKS)
     }
 
@@ -1616,7 +1691,7 @@ async def _start_bot_and_jobs():
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
         jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
         await application.start()
-        log.info("Bot initialized & started with Twitter Auto Separate Messages mode")
+        log.info("Bot initialized & started with LIVE price detection for buy bot integration")
     except Exception as e:
         log.exception("Bot startup failed: %r", e)
 
