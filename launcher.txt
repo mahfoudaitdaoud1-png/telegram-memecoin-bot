@@ -1,6 +1,6 @@
 cd ~/telegram-bot && \
 python3 -m pip install --upgrade 'python-telegram-bot[job-queue]==21.6' requests && \
-export TG='8553281513:AAFA7j-lEBigFYDkVuQawIKNfS-B_52oYMc' \
+export TG='8310323018:AAEJxIYry4fc-AOcsJzoUScXJ4jM6sIyC2I' \
 ALERT_CHAT_ID=1502658246 \
 TRADE_SUMMARY_SEC=5 \
 UPDATE_INTERVAL_SEC=90 \
