@@ -1431,7 +1431,8 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"/scrape <url> - Manually scrape Twitter\n"
         f"/blacklist - Manage username blacklist\n"
         f"/clearpins - Unpin all tracked pins\n"
-        f"/testreaders - Test reader services"
+        f"/testreaders - Test reader services\n"
+        f"/reset - Fresh start (clears all state)"
     )
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1782,6 +1783,68 @@ async def cmd_clearpins(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"{'❌ Failed: ' + str(failed) if failed > 0 else ''}"
     )
 
+async def cmd_reset(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Reset all bot state for this chat - fresh start"""
+    global TRACKED, LAST_PINNED
+    
+    chat_id = u.effective_chat.id
+    
+    await u.message.reply_text(
+        "🔄 Resetting bot state...\n"
+        "This will:\n"
+        "• Unpin all tracked messages\n"
+        "• Clear tracked tokens\n"
+        "• Clear Twitter cache\n"
+        "• Clear pin history\n"
+        "• Give you a fresh start\n\n"
+        "⏳ Processing..."
+    )
+    
+    # 1. Unpin all messages for this chat
+    unpinned = 0
+    if chat_id in PINNED_MESSAGES:
+        pins = PINNED_MESSAGES[chat_id].copy()
+        for pin_info in pins:
+            try:
+                await c.bot.unpin_chat_message(chat_id, pin_info["msg_id"])
+                unpinned += 1
+            except Exception as e:
+                log.warning(f"[Reset] Failed to unpin {pin_info['msg_id']}: {e}")
+        
+        # Clear pin tracking for this chat
+        PINNED_MESSAGES[chat_id] = []
+        _save_pinned_messages()
+    
+    # 2. Clear LAST_PINNED entries for this chat
+    keys_to_remove = [key for key in LAST_PINNED if key[0] == chat_id]
+    for key in keys_to_remove:
+        del LAST_PINNED[key]
+    
+    # 3. Clear all tracked tokens (affects all subscribers)
+    tracked_count = len(TRACKED)
+    TRACKED.clear()
+    
+    # 4. Clear Twitter cache
+    cache_count = len(twitter_scraper.cache)
+    twitter_scraper.cache.clear()
+    twitter_scraper._save_cache()
+    
+    # 5. Log the reset
+    log.info(f"[Reset] User {chat_id} performed full reset:")
+    log.info(f"  - Unpinned: {unpinned} messages")
+    log.info(f"  - Cleared: {tracked_count} tracked tokens")
+    log.info(f"  - Cleared: {cache_count} Twitter cache entries")
+    
+    await u.message.reply_text(
+        f"✅ Reset Complete!\n\n"
+        f"📌 Unpinned: {unpinned} messages\n"
+        f"🔍 Cleared: {tracked_count} tracked tokens\n"
+        f"🐦 Cleared: {cache_count} Twitter cache entries\n"
+        f"🗑️ Cleared: {len(keys_to_remove)} pin history entries\n\n"
+        f"🎉 You now have a fresh start!\n"
+        f"New tokens will be detected and tracked normally."
+    )
+
 async def _post_init(app: Application):
     global SUBS, MY_HANDLES, TWITTER_BLACKLIST, PINNED_MESSAGES
     SUBS = _load_subs_from_file()
@@ -1811,6 +1874,7 @@ application.add_handler(CommandHandler("clearcache", cmd_clearcache))
 application.add_handler(CommandHandler("blacklist", cmd_blacklist))
 application.add_handler(CommandHandler("testreaders", cmd_testreaders))
 application.add_handler(CommandHandler("clearpins", cmd_clearpins))
+application.add_handler(CommandHandler("reset", cmd_reset))
 
 app = FastAPI(title="Telegram Webhook")
 app.add_middleware(GZipMiddleware, minimum_size=512)
