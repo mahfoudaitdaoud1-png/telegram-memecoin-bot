@@ -44,10 +44,10 @@ if not TG:
     raise SystemExit("Missing TG token (env TG)")
 
 ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID", "0"))
-TRADE_SUMMARY_SEC       = int(os.getenv("TRADE_SUMMARY_SEC", "5"))
+TRADE_SUMMARY_SEC       = int(os.getenv("TRADE_SUMMARY_SEC", "3"))
 UPDATE_INTERVAL_SEC     = int(os.getenv("UPDATE_INTERVAL_SEC", "90"))
 UPDATE_MAX_DURATION_MIN = int(os.getenv("UPDATE_MAX_DURATION_MIN", "60"))
-INGEST_INTERVAL_SEC     = int(os.getenv("INGEST_INTERVAL_SEC", "12"))
+INGEST_INTERVAL_SEC     = int(os.getenv("INGEST_INTERVAL_SEC", "8"))
 
 DEBUG_FB = os.getenv("DEBUG_FB", "0") == "1"
 
@@ -706,34 +706,73 @@ LAST_PINNED: Dict[Tuple[int, str], int] = {}
 def decorate_with_first_seen(pairs):
     """
     Decorate pairs with first-seen data.
-    For NEW tokens: Use current Dexscreener price as "first" (not pre-market/pump.fun).
-    This shows 0% change on first detection, then real movement from Dexscreener baseline.
+    For NEW tokens: Fetch FRESH API data to ensure accurate baseline.
+    This fixes the issue where mirror data is stale, causing wrong "first" mcap.
     """
     changed=False; now_ts=int(time.time())
     for m in pairs:
         tok = m.get("token") or ""
-        cur_mcap = float(m.get("mcap_usd") or 0)
-        cur_price = float(m.get("price_usd") or 0)
         rec = FIRST_SEEN.get(tok)
         is_new = rec is None
         
         if is_new:
-            # NEW TOKEN: Use CURRENT Dexscreener data as baseline
-            # This shows 0% on first detection, avoiding misleading pre-market pumps
-            log.info(f"[Detection] NEW token {tok[:8]}... First seen at ${cur_mcap:,.0f}")
+            # NEW TOKEN: Fetch FRESH data from Dexscreener API
+            # Don't trust mirror data - it might be stale!
+            log.info(f"[Detection] NEW token {tok[:8]}... Fetching LIVE data from API...")
             
-            FIRST_SEEN[tok] = {
-                "first": cur_mcap,  # Current Dexscreener mcap (shows 0% initially)
-                "first_price": cur_price,  # Current price
-                "ts": now_ts,
-                "tw_handle": m.get("tw_handle"),
-                "tw_url": m.get("tw_url"),
-            }
+            fresh_data = _best_pool_for_mint(CHAIN_ID, tok)
             
-            log.info(f"[Detection] Baseline set: ${cur_mcap:,.0f} (price: ${cur_price:.8f})")
+            if fresh_data:
+                # Extract LIVE mcap from fresh API data
+                fresh_fdv = fresh_data.get("fdv")
+                fresh_mcap = float(fresh_fdv if fresh_fdv is not None else 
+                                  (fresh_data.get("marketCap") or 0) or 0)
+                
+                # Extract LIVE price
+                fresh_price = _get_price_usd(fresh_data)
+                
+                # Extract fresh Twitter info if available
+                fresh_info = fresh_data.get("info") or {}
+                fresh_handle, fresh_url = _extract_x(fresh_info)
+                
+                log.info(f"[Detection] LIVE data fetched: ${fresh_mcap:,.0f} (price: ${fresh_price:.8f})")
+                
+                # Save LIVE data as baseline
+                FIRST_SEEN[tok] = {
+                    "first": fresh_mcap,  # LIVE mcap from API
+                    "first_price": fresh_price,  # LIVE price from API
+                    "ts": now_ts,
+                    "tw_handle": fresh_handle or m.get("tw_handle"),
+                    "tw_url": fresh_url or m.get("tw_url"),
+                }
+                
+                # CRITICAL: Update the dict with LIVE data so current matches first!
+                m["mcap_usd"] = fresh_mcap
+                m["price_usd"] = fresh_price
+                if fresh_handle:
+                    m["tw_handle"] = fresh_handle
+                if fresh_url:
+                    m["tw_url"] = fresh_url
+                
+                log.info(f"[Detection] ✅ Baseline set: ${fresh_mcap:,.0f} (both first and current)")
+            else:
+                # Fallback: couldn't fetch fresh data, use mirror data
+                log.warning(f"[Detection] Could not fetch fresh data for {tok[:8]}..., using mirror data")
+                cur_mcap = float(m.get("mcap_usd") or 0)
+                cur_price = float(m.get("price_usd") or 0)
+                
+                FIRST_SEEN[tok] = {
+                    "first": cur_mcap,
+                    "first_price": cur_price,
+                    "ts": now_ts,
+                    "tw_handle": m.get("tw_handle"),
+                    "tw_url": m.get("tw_url"),
+                }
+            
             changed=True
         else:
             # Existing token: update only if needed
+            cur_mcap = float(m.get("mcap_usd") or 0)
             if rec.get("first",0)==0 and cur_mcap>0:
                 rec["first"]=cur_mcap; changed=True
             if not rec.get("tw_handle") and m.get("tw_handle"):
@@ -1278,17 +1317,16 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     _save_subs_to_file()
     await u.message.reply_text(
         f"✅ Subscribed!\n\n"
-        f"🔥 New tokens every {TRADE_SUMMARY_SEC}s\n"
+        f"🔥 New tokens every {TRADE_SUMMARY_SEC}s (optimized for speed)\n"
         f"🧊 Price updates every {UPDATE_INTERVAL_SEC}s\n"
         f"🐦 Twitter scraper: {'Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n"
-        f"📊 Price tracking: Dexscreener baseline (0% on first detection)\n\n"
+        f"📊 Price tracking: Fresh API data (accurate 0% baseline)\n\n"
         f"Commands:\n"
         f"/status - Bot stats\n"
         f"/trade [N] - Show N tokens\n"
         f"/scrape <url> - Manually scrape Twitter\n"
         f"/blacklist - Manage username blacklist\n"
-        f"/blacklist add username - Block a user\n"
-        f"/blacklist remove username - Unblock a user"
+        f"/resettoken <mint> - Reset token baseline"
     )
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1319,7 +1357,8 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Twitter cache: {cache_size} entries\n"
         f"Active scrape tasks: {len(BACKGROUND_TASKS)}\n"
         f"Scraper: {'✅ Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else '❌ Disabled'}\n"
-        f"Price tracking: ✅ Dexscreener baseline (0% on first detection)"
+        f"Detection speed: ⚡ {TRADE_SUMMARY_SEC}s (optimized)\n"
+        f"Price tracking: ✅ Fresh API data (accurate baseline)"
     )
 
 async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -1590,6 +1629,37 @@ async def cmd_testreaders(u: Update, c: ContextTypes.DEFAULT_TYPE):
     
     await u.message.reply_text(message)
 
+async def cmd_resettoken(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Reset first_seen data for a token - /resettoken <mint_address>"""
+    global FIRST_SEEN
+    args = (u.message.text or "").split()
+    
+    if len(args) < 2:
+        await u.message.reply_text(
+            "Usage: /resettoken <mint_address>\n\n"
+            "This will delete stored first_seen data for a token,\n"
+            "so next detection will use current Dexscreener price as baseline.\n\n"
+            "Example: /resettoken 93JM7cyW..."
+        )
+        return
+    
+    token = args[1].strip()
+    
+    if token not in FIRST_SEEN:
+        await u.message.reply_text(f"❌ Token not found in first_seen data")
+        return
+    
+    old_first = FIRST_SEEN[token].get("first", 0)
+    del FIRST_SEEN[token]
+    _save_first_seen(FIRST_SEEN)
+    
+    await u.message.reply_text(
+        f"✅ Reset token data\n\n"
+        f"Token: {token[:16]}...\n"
+        f"Old first mcap: ${old_first:,.0f}\n\n"
+        f"Next detection will set new baseline from current Dexscreener price"
+    )
+
 async def _post_init(app: Application):
     global SUBS, MY_HANDLES, TWITTER_BLACKLIST
     SUBS = _load_subs_from_file()
@@ -1603,7 +1673,8 @@ async def _post_init(app: Application):
     log.info(f"Following: {len(MY_HANDLES)} handles")
     log.info(f"Blacklist: {len(TWITTER_BLACKLIST)} usernames")
     log.info(f"Twitter scraper: {'Enabled (Auto separate messages mode)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}")
-    log.info(f"Price detection: Dexscreener baseline (accurate % tracking)")
+    log.info(f"Detection speed: ⚡ Every {TRADE_SUMMARY_SEC}s (optimized)")
+    log.info(f"Price tracking: Fresh API data on first detection (accurate baseline)")
 
 application = Application.builder().token(TG).post_init(_post_init).build()
 application.add_handler(CommandHandler("start", cmd_start))
@@ -1617,6 +1688,7 @@ application.add_handler(CommandHandler("scrape", cmd_scrape))
 application.add_handler(CommandHandler("clearcache", cmd_clearcache))
 application.add_handler(CommandHandler("blacklist", cmd_blacklist))
 application.add_handler(CommandHandler("testreaders", cmd_testreaders))
+application.add_handler(CommandHandler("resettoken", cmd_resettoken))
 
 app = FastAPI(title="Telegram Webhook")
 app.add_middleware(GZipMiddleware, minimum_size=512)
@@ -1627,7 +1699,9 @@ async def health_root():
         "ok": True, 
         "twitter_scraper": TWITTER_SCRAPER_ENABLED, 
         "mode": "auto_separate_messages",
-        "price_detection": "dexscreener_baseline",
+        "price_detection": "fresh_api_data",
+        "detection_speed": f"{TRADE_SUMMARY_SEC}s",
+        "ingestion_speed": f"{INGEST_INTERVAL_SEC}s",
         "active_tasks": len(BACKGROUND_TASKS)
     }
 
@@ -1653,7 +1727,7 @@ async def _start_bot_and_jobs():
         jq.run_repeating(auto_trade, interval=timedelta(seconds=TRADE_SUMMARY_SEC), first=timedelta(seconds=3), name="trade_tick")
         jq.run_repeating(updater, interval=timedelta(seconds=UPDATE_INTERVAL_SEC), first=timedelta(seconds=20), name="updates")
         await application.start()
-        log.info("Bot initialized & started with Dexscreener baseline tracking")
+        log.info("Bot initialized & started with optimized speed (3s alerts, 8s ingestion) and fresh API data tracking")
     except Exception as e:
         log.exception("Bot startup failed: %r", e)
 
