@@ -29,6 +29,24 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ========== BUY BOT INTEGRATION ==========
+try:
+    from buy_bot.trading_bot import initialize_trading_bot, trading_bot
+    from buy_bot.config import TradingConfig
+    from buy_bot.telegram_commands import (
+        cmd_on, cmd_off, cmd_status as cmd_buybot_status, cmd_portfolio,
+        cmd_setamount, cmd_setbullseye, cmd_maxpositions,
+        cmd_settp, cmd_setstop, cmd_jito,
+        get_edit_conversation_handler
+    )
+    BUY_BOT_ENABLED = True
+    log.info("✅ Buy bot module loaded")
+except ImportError as e:
+    log.warning(f"⚠️  Buy bot not available: {e}")
+    BUY_BOT_ENABLED = False
+    trading_bot = None
+# ========== END BUY BOT INTEGRATION ==========
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
@@ -706,64 +724,37 @@ LAST_PINNED: Dict[Tuple[int, str], int] = {}
 def decorate_with_first_seen(pairs):
     """
     Decorate pairs with first-seen data.
-    For NEW tokens: Fetch LIVE data from Dexscreener API at detection moment.
-    This ensures "first" price is the ACTUAL current market price (not stale mirror data).
-    Critical for buy bot integration - enables accurate order placement.
+    For NEW tokens: Use current Dexscreener price as "first" (not pre-market/pump.fun).
+    This shows 0% change on first detection, then real movement from Dexscreener baseline.
+    Buy bot gets accurate current price for order placement.
     """
     changed=False; now_ts=int(time.time())
     for m in pairs:
         tok = m.get("token") or ""
-        cur = float(m.get("mcap_usd") or 0)
+        cur_mcap = float(m.get("mcap_usd") or 0)
+        cur_price = float(m.get("price_usd") or 0)
         rec = FIRST_SEEN.get(tok)
         is_new = rec is None
         
         if is_new:
-            # NEW TOKEN: Fetch LIVE data at detection moment for accurate "first" price
-            log.info(f"[Detection] NEW token {tok[:8]}... detected! Fetching LIVE data...")
+            # NEW TOKEN: Use CURRENT Dexscreener data as baseline
+            # This shows 0% on first detection, avoiding misleading pre-market pumps
+            log.info(f"[Detection] NEW token {tok[:8]}... First seen at ${cur_mcap:,.0f}")
             
-            # Fetch fresh data from Dexscreener API
-            fresh_data = _best_pool_for_mint(CHAIN_ID, tok)
+            FIRST_SEEN[tok] = {
+                "first": cur_mcap,  # Current Dexscreener mcap (shows 0% initially)
+                "first_price": cur_price,  # Current price for buy bot
+                "ts": now_ts,
+                "tw_handle": m.get("tw_handle"),
+                "tw_url": m.get("tw_url"),
+            }
             
-            if fresh_data:
-                # Extract LIVE mcap from fresh data
-                fresh_fdv = fresh_data.get("fdv")
-                fresh_mcap = float(fresh_fdv if fresh_fdv is not None else (fresh_data.get("marketCap") or 0) or 0)
-                
-                # Extract LIVE price (critical for buy bot!)
-                fresh_price = _get_price_usd(fresh_data)
-                
-                # Extract fresh Twitter info if available
-                fresh_info = fresh_data.get("info") or {}
-                fresh_handle, fresh_url = _extract_x(fresh_info)
-                
-                # Use LIVE mcap as "first" (locked forever)
-                first_mcap = fresh_mcap if fresh_mcap > 0 else cur
-                
-                log.info(f"[Detection] LIVE mcap at detection: ${first_mcap:,.0f} (price: ${fresh_price:.8f})")
-                
-                FIRST_SEEN[tok] = {
-                    "first": first_mcap,  # LIVE mcap at detection moment
-                    "first_price": fresh_price,  # LIVE price for buy bot
-                    "ts": now_ts,
-                    "tw_handle": fresh_handle or m.get("tw_handle"),
-                    "tw_url": fresh_url or m.get("tw_url"),
-                }
-            else:
-                # Fallback: couldn't fetch fresh data, use current
-                log.warning(f"[Detection] Could not fetch fresh data for {tok[:8]}..., using mirror data")
-                FIRST_SEEN[tok] = {
-                    "first": (cur if cur>0 else 0.0), 
-                    "first_price": m.get("price_usd", 0.0),
-                    "ts": now_ts,
-                    "tw_handle": m.get("tw_handle"),
-                    "tw_url": m.get("tw_url"),
-                }
-            
+            log.info(f"[Detection] Baseline set: ${cur_mcap:,.0f} (price: ${cur_price:.8f})")
             changed=True
         else:
             # Existing token: update only if needed
-            if rec.get("first",0)==0 and cur>0:
-                rec["first"]=cur; changed=True
+            if rec.get("first",0)==0 and cur_mcap>0:
+                rec["first"]=cur_mcap; changed=True
             if not rec.get("tw_handle") and m.get("tw_handle"):
                 rec["tw_handle"] = m.get("tw_handle")
                 changed = True
@@ -1037,38 +1028,26 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     first = float(m.get("first_mcap_usd") or 0)
     cur   = float(m.get("mcap_usd") or 0)
     pct   = _pct_str(first, cur)
-    circle= "🟢" if (first>0 and cur>=first) else "🔴"
+    
+    # Emoji logic:
+    # - First detection (is_update=False): Both blue (neutral, just detected)
+    # - Updates (is_update=True): Green if up, red if down
+    if is_update:
+        # Updates: green/red based on movement
+        circle = "🟢" if (first>0 and cur>=first) else "🔴"
+        first_emoji = BLUE  # First mcap always blue (locked baseline)
+    else:
+        # First detection: both blue (neutral)
+        circle = BLUE
+        first_emoji = BLUE
+    
     price = float(m.get("price_usd") or 0)
     header = f"{fire_or_ice} <b>{html_escape(m['name'])}</b>"
     price_line = f"💵 <b>Price:</b> " + (f"${price:.8f}" if price < 1 else f"${price:,.4f}")
     
-    # Get detection timestamp to show how fresh the data is
-    token = m.get("token")
-    detected_ago = ""
-    if token and token in FIRST_SEEN:
-        detection_ts = FIRST_SEEN[token].get("ts", 0)
-        if detection_ts > 0:
-            try:
-                seconds_ago = int(time.time() - detection_ts)
-                if seconds_ago < 0:
-                    # Future timestamp = corrupted data
-                    detected_ago = ""
-                elif seconds_ago < 60:
-                    detected_ago = f" ({seconds_ago}s ago)"
-                elif seconds_ago < 3600:
-                    detected_ago = f" ({seconds_ago // 60}m ago)"
-                elif seconds_ago < 86400:
-                    detected_ago = f" ({seconds_ago // 3600}h ago)"
-                else:
-                    # More than 24h ago = too old, don't show
-                    detected_ago = ""
-            except Exception as e:
-                log.warning(f"[Caption] Timestamp calc error for {token[:8]}...: {e}")
-                detected_ago = ""
-    
     return (
         f"{header}\n"
-        f"{BANK} <b>First Mcap (LIVE):</b> {BLUE} ${first:,.0f}{detected_ago}\n"
+        f"{BANK} <b>First Mcap:</b> {first_emoji} ${first:,.0f}\n"
         f"{BANK} <b>Current Mcap:</b> {circle} ${cur:,.0f} <b>({pct})</b>\n"
         f"🖨️ <b>Mint:</b>\n<code>{html_escape(m['token'])}</code>\n"
         f"🔗 <b>Pair:</b>\n<code>{html_escape(m['pair'])}</code>\n"
@@ -1190,6 +1169,37 @@ async def send_new_token(bot, chat_id: int, m: dict):
         log.info(f"[Alert] Sent alert for {m.get('name')} (already scraped, showing stored data)")
     else:
         log.info(f"[Alert] Sent alert for {m.get('name')} (no Twitter URL to scrape)")
+    
+    # ========== BUY BOT TRIGGER ==========
+    if BUY_BOT_ENABLED and trading_bot and trading_bot.is_active:
+        try:
+            # Wait for Twitter scraping to complete
+            await asyncio.sleep(3)
+            
+            # Get latest Twitter data
+            record = FIRST_SEEN.get(token, {})
+            tw_overlap = record.get("tw_overlap", "—")
+            bullseye_count = tw_overlap.count('🎯')
+            
+            # Prepare token data for buy bot
+            token_data = {
+                'token': token,
+                'name': m.get('name', 'Unknown'),
+                'price_usd': m.get('price_usd', 0.0),
+                'first_price': record.get('first_price', m.get('price_usd', 0.0)),
+                'mcap_usd': m.get('mcap_usd', 0.0),
+                'first_mcap_usd': m.get('first_mcap_usd', 0.0),
+                'tw_overlap': tw_overlap,
+                'bullseye_count': bullseye_count
+            }
+            
+            # Log and trigger
+            log.info(f"🤖 Buy bot check: {m.get('name')} → {bullseye_count} bullseye users")
+            await trading_bot.on_token_detected(token_data)
+            
+        except Exception as e:
+            log.error(f"❌ Buy bot trigger error: {e}")
+    # ========== END BUY BOT TRIGGER ==========
 
 async def send_price_update(bot, chat_id: int, m: dict):
     """
@@ -1656,6 +1666,22 @@ application.add_handler(CommandHandler("clearcache", cmd_clearcache))
 application.add_handler(CommandHandler("blacklist", cmd_blacklist))
 application.add_handler(CommandHandler("testreaders", cmd_testreaders))
 
+# ========== BUY BOT COMMANDS ==========
+if BUY_BOT_ENABLED:
+    application.add_handler(CommandHandler("on", cmd_on))
+    application.add_handler(CommandHandler("off", cmd_off))
+    application.add_handler(CommandHandler("buybotstatus", cmd_buybot_status))
+    application.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    application.add_handler(CommandHandler("setamount", cmd_setamount))
+    application.add_handler(CommandHandler("setbullseye", cmd_setbullseye))
+    application.add_handler(CommandHandler("maxpositions", cmd_maxpositions))
+    application.add_handler(CommandHandler("settp", cmd_settp))
+    application.add_handler(CommandHandler("setstop", cmd_setstop))
+    application.add_handler(CommandHandler("jito", cmd_jito))
+    application.add_handler(get_edit_conversation_handler())
+    log.info("✅ Buy bot commands registered")
+# ========== END BUY BOT COMMANDS ==========
+
 app = FastAPI(title="Telegram Webhook")
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
@@ -1681,6 +1707,25 @@ async def _startup():
     MIRROR = _mirror_load()
     MY_HANDLES = load_my_following()
     TWITTER_BLACKLIST = load_twitter_blacklist()
+    
+    # ========== BUY BOT STARTUP ==========
+    if BUY_BOT_ENABLED:
+        try:
+            log.info("🤖 Initializing Buy Bot...")
+            config = TradingConfig()
+            await initialize_trading_bot(config)
+            balance = await trading_bot.wallet.get_balance(config.rpc_endpoint)
+            log.info(f"✅ Buy Bot ready! Wallet: {trading_bot.wallet.public_key}")
+            log.info(f"   💰 Balance: {balance:.4f} SOL (${balance * 100:.2f})")
+            if balance < config.buy_amount_sol * 3:
+                log.warning(f"   ⚠️  Low balance! Consider adding more SOL")
+        except Exception as e:
+            log.error(f"❌ Buy Bot init failed: {e}")
+            log.error("   Check environment variables: TRADING_WALLET_PRIVATE_KEY, SOLANA_RPC_URL")
+    else:
+        log.info("⚠️  Buy bot not installed. To enable: pip install -r buy-bot/requirements.txt")
+    # ========== END BUY BOT STARTUP ==========
+    
     asyncio.create_task(_start_bot_and_jobs())
 
 async def _start_bot_and_jobs():
