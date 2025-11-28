@@ -1145,8 +1145,29 @@ async def send_new_token(bot, chat_id: int, m: dict):
     """
     Send new token alert immediately
     Trigger automatic separate scraping message in background (if not already scraped)
+    
+    PINNING LOGIC:
+    When a message will be pinned, we DELETE old FIRST_SEEN data and force fresh detection.
+    This ensures pinned messages always show 🔥 FIRE with 0% and fresh API baseline.
     """
     token = m.get("token")
+    key = (chat_id, token or "")
+    should_pin = key not in LAST_PINNED
+    
+    # OPTION A: Reset baseline when pinning
+    if should_pin and token:
+        if token in FIRST_SEEN:
+            old_first = FIRST_SEEN[token].get("first", 0)
+            log.info(f"[Pin] Resetting baseline for {token[:8]}... (old: ${old_first:,.0f})")
+            del FIRST_SEEN[token]
+            _save_first_seen(FIRST_SEEN)
+        
+        # Force this to be treated as first_time
+        m["is_first_time"] = True
+        
+        # Trigger fresh API fetch by removing from dict temporarily
+        # decorate_with_first_seen will see it as new and fetch fresh data
+        log.info(f"[Pin] Token will be fetched fresh and shown as 🔥 with 0%")
     
     # Check if we already have stored Twitter data
     record = FIRST_SEEN.get(token, {})
@@ -1155,8 +1176,6 @@ async def send_new_token(bot, chat_id: int, m: dict):
     m["_is_update"] = False
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
-    key = (chat_id, m.get("token") or "")
-    should_pin = key not in LAST_PINNED
     
     msg_id = await _send_or_photo(
         bot, chat_id, caption, kb,
@@ -1167,6 +1186,7 @@ async def send_new_token(bot, chat_id: int, m: dict):
     
     if should_pin and msg_id:
         LAST_PINNED[key] = msg_id
+        log.info(f"[Pin] ✅ Pinned message {msg_id} for {token[:8]}...")
     
     # Only scrape if NOT already scraped
     tw_url = m.get("tw_url")
