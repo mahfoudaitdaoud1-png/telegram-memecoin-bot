@@ -1159,7 +1159,11 @@ async def send_new_token(bot, chat_id: int, m: dict):
     record = FIRST_SEEN.get(token, {})
     fb_text = record.get("tw_overlap", "—")
     
+    # CRITICAL: Force is_first_time=True because send_new_token means NEW ALERT
+    # Even if token was seen before restart, this is a NEW ALERT so show 🔥 FIRE
+    m["is_first_time"] = True
     m["_is_update"] = False
+    
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
     
