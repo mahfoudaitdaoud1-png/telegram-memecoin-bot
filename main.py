@@ -1011,7 +1011,6 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     fire_or_ice = "🧊" if is_update else ("🔥" if m.get("is_first_time") else "🧊")
     first = float(m.get("first_mcap_usd") or 0)
     cur   = float(m.get("mcap_usd") or 0)
-    pct   = _pct_str(first, cur)
     
     # Emoji logic:
     # - First detection (is_first_time=True): Both blue (neutral, just detected at this price)
@@ -1019,13 +1018,17 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     is_first = m.get("is_first_time", False)
     
     if is_first:
-        # First detection: both blue emojis (0% baseline)
+        # First detection: both blue emojis, show N/A for percentage
         first_emoji = BLUE
         current_emoji = BLUE
+        pct = "N/A"  # No percentage on first detection
+        first_label = f"{BANK} <b>First Mcap (Onchain):</b>"  # Add (Onchain) label
     else:
         # Updates: first always blue, current shows movement
         first_emoji = BLUE
         current_emoji = "🟢" if (first > 0 and cur >= first) else "🔴"
+        pct = _pct_str(first, cur)  # Show real percentage
+        first_label = f"{BANK} <b>First Mcap:</b>"  # No (Onchain) label on updates
     
     price = float(m.get("price_usd") or 0)
     header = f"{fire_or_ice} <b>{html_escape(m['name'])}</b>"
@@ -1033,7 +1036,7 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     
     return (
         f"{header}\n"
-        f"{BANK} <b>First Mcap:</b> {first_emoji} ${first:,.0f}\n"
+        f"{first_label} {first_emoji} ${first:,.0f}\n"
         f"{BANK} <b>Current Mcap:</b> {current_emoji} ${cur:,.0f} <b>({pct})</b>\n"
         f"🖨️ <b>Mint:</b>\n<code>{html_escape(m['token'])}</code>\n"
         f"🔗 <b>Pair:</b>\n<code>{html_escape(m['pair'])}</code>\n"
