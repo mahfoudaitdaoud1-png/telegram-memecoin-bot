@@ -1146,28 +1146,14 @@ async def send_new_token(bot, chat_id: int, m: dict):
     Send new token alert immediately
     Trigger automatic separate scraping message in background (if not already scraped)
     
-    PINNING LOGIC:
-    When a message will be pinned, we DELETE old FIRST_SEEN data and force fresh detection.
-    This ensures pinned messages always show 🔥 FIRE with 0% and fresh API baseline.
+    CLEAN SEQUENCE:
+    1. Send first detection (with fresh API data) → PIN
+    2. Trigger scraping in background (separate message)
+    3. Wait for update cycle (90s) → Shows scrape results in update
     """
     token = m.get("token")
     key = (chat_id, token or "")
     should_pin = key not in LAST_PINNED
-    
-    # OPTION A: Reset baseline when pinning
-    if should_pin and token:
-        if token in FIRST_SEEN:
-            old_first = FIRST_SEEN[token].get("first", 0)
-            log.info(f"[Pin] Resetting baseline for {token[:8]}... (old: ${old_first:,.0f})")
-            del FIRST_SEEN[token]
-            _save_first_seen(FIRST_SEEN)
-        
-        # Force this to be treated as first_time
-        m["is_first_time"] = True
-        
-        # Trigger fresh API fetch by removing from dict temporarily
-        # decorate_with_first_seen will see it as new and fetch fresh data
-        log.info(f"[Pin] Token will be fetched fresh and shown as 🔥 with 0%")
     
     # Check if we already have stored Twitter data
     record = FIRST_SEEN.get(token, {})
