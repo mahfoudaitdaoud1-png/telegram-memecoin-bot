@@ -706,8 +706,9 @@ LAST_PINNED: Dict[Tuple[int, str], int] = {}
 def decorate_with_first_seen(pairs):
     """
     Decorate pairs with first-seen data.
-    For NEW tokens: Fetch FRESH API data to ensure accurate baseline.
-    This fixes the issue where mirror data is stale, causing wrong "first" mcap.
+    For NEW tokens: Use CURRENT mirror data as baseline (no API fetch).
+    This ensures both first and current show the ACTUAL TRADING PRICE at detection.
+    NO MORE MIGRATION PRICES - just real Dexscreener trading price!
     """
     changed=False; now_ts=int(time.time())
     for m in pairs:
@@ -716,59 +717,22 @@ def decorate_with_first_seen(pairs):
         is_new = rec is None
         
         if is_new:
-            # NEW TOKEN: Fetch FRESH data from Dexscreener API
-            # Don't trust mirror data - it might be stale!
-            log.info(f"[Detection] NEW token {tok[:8]}... Fetching LIVE data from API...")
+            # NEW TOKEN: Use CURRENT data from mirror (already has trading price)
+            # Don't fetch API - mirror data is accurate for current trading!
+            cur_mcap = float(m.get("mcap_usd") or 0)
+            cur_price = float(m.get("price_usd") or 0)
             
-            fresh_data = _best_pool_for_mint(CHAIN_ID, tok)
+            log.info(f"[Detection] NEW token {tok[:8]}... First seen at ${cur_mcap:,.0f} (price: ${cur_price:.8f})")
             
-            if fresh_data:
-                # Extract LIVE mcap from fresh API data
-                fresh_fdv = fresh_data.get("fdv")
-                fresh_mcap = float(fresh_fdv if fresh_fdv is not None else 
-                                  (fresh_data.get("marketCap") or 0) or 0)
-                
-                # Extract LIVE price
-                fresh_price = _get_price_usd(fresh_data)
-                
-                # Extract fresh Twitter info if available
-                fresh_info = fresh_data.get("info") or {}
-                fresh_handle, fresh_url = _extract_x(fresh_info)
-                
-                log.info(f"[Detection] LIVE data fetched: ${fresh_mcap:,.0f} (price: ${fresh_price:.8f})")
-                
-                # Save LIVE data as baseline
-                FIRST_SEEN[tok] = {
-                    "first": fresh_mcap,  # LIVE mcap from API
-                    "first_price": fresh_price,  # LIVE price from API
-                    "ts": now_ts,
-                    "tw_handle": fresh_handle or m.get("tw_handle"),
-                    "tw_url": fresh_url or m.get("tw_url"),
-                }
-                
-                # CRITICAL: Update the dict with LIVE data so current matches first!
-                m["mcap_usd"] = fresh_mcap
-                m["price_usd"] = fresh_price
-                if fresh_handle:
-                    m["tw_handle"] = fresh_handle
-                if fresh_url:
-                    m["tw_url"] = fresh_url
-                
-                log.info(f"[Detection] ✅ Baseline set: ${fresh_mcap:,.0f} (both first and current)")
-            else:
-                # Fallback: couldn't fetch fresh data, use mirror data
-                log.warning(f"[Detection] Could not fetch fresh data for {tok[:8]}..., using mirror data")
-                cur_mcap = float(m.get("mcap_usd") or 0)
-                cur_price = float(m.get("price_usd") or 0)
-                
-                FIRST_SEEN[tok] = {
-                    "first": cur_mcap,
-                    "first_price": cur_price,
-                    "ts": now_ts,
-                    "tw_handle": m.get("tw_handle"),
-                    "tw_url": m.get("tw_url"),
-                }
+            FIRST_SEEN[tok] = {
+                "first": cur_mcap,  # Current trading mcap from mirror
+                "first_price": cur_price,  # Current trading price from mirror
+                "ts": now_ts,
+                "tw_handle": m.get("tw_handle"),
+                "tw_url": m.get("tw_url"),
+            }
             
+            log.info(f"[Detection] ✅ Baseline set: ${cur_mcap:,.0f} (both first and current match)")
             changed=True
         else:
             # Existing token: update only if needed
