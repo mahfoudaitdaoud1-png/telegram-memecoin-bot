@@ -1171,23 +1171,47 @@ async def send_new_token(bot, chat_id: int, m: dict):
 
 async def send_price_update(bot, chat_id: int, m: dict):
     """
-    Send price update - uses stored Twitter overlap from m dict OR FIRST_SEEN
+    Send price update for tracked token
+    
+    CRITICAL: Must load saved baseline from FIRST_SEEN, NOT use API's first_mcap_usd
     """
     token = m.get("token")
     
-    # Try to get from m dict first (passed from updater), fallback to FIRST_SEEN
-    fb_text = m.get("tw_overlap")
-    if not fb_text or fb_text == "—":
-        record = FIRST_SEEN.get(token, {})
-        fb_text = record.get("tw_overlap", "—")
+    # Load saved baseline from FIRST_SEEN
+    first_rec = FIRST_SEEN.get(token) or {}
+    saved_baseline = float(first_rec.get("first", 0))
     
-    # Debug logging
-    if fb_text != "—":
-        log.info(f"[Update] {m.get('name')} - Using Twitter data: {len(fb_text)} chars")
+    # CRITICAL: Overwrite API's first_mcap_usd with saved baseline
+    # The API returns onchain price ($78k), but we want detection price ($134k)
+    if saved_baseline > 0:
+        m["first_mcap_usd"] = saved_baseline
+        log.info(f"[Update] {token[:8]}... Using saved baseline: ${saved_baseline:,.0f}")
+    else:
+        # Fallback if no saved baseline (shouldn't happen)
+        log.warning(f"[Update] {token[:8]}... No saved baseline, using API value")
+    
+    # Get stored Twitter data
+    stored_tw_handle = first_rec.get("tw_handle")
+    stored_tw_url = first_rec.get("tw_url")
+    stored_tw_overlap = first_rec.get("tw_overlap", "—")
+    
+    # Use stored Twitter data if available
+    if stored_tw_handle and not m.get("tw_handle"):
+        m["tw_handle"] = stored_tw_handle
+    if stored_tw_url and not m.get("tw_url"):
+        m["tw_url"] = stored_tw_url
+    
+    fb_text = stored_tw_overlap
+    
+    # Check if we have scraped data
+    if first_rec.get("tw_scraped"):
+        log.info(f"[Update] {m.get('name')} - Using stored Twitter data: {fb_text}")
     else:
         log.warning(f"[Update] {m.get('name')} - No Twitter data available")
     
     m["_is_update"] = True
+    m["is_first_time"] = False  # Make sure it's marked as update
+    
     caption = build_caption(m, fb_text, is_update=True)
     kb = link_keyboard(m)
     
