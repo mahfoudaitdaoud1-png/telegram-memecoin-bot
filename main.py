@@ -29,12 +29,34 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ========== BUY BOT INTEGRATION ==========
+try:
+    from buy_bot.trading_bot import initialize_trading_bot, trading_bot
+    from buy_bot.config import TradingConfig
+    from buy_bot.telegram_commands import (
+        cmd_on, cmd_off, cmd_status as cmd_buybot_status, cmd_portfolio,
+        cmd_setamount, cmd_setbullseye, cmd_maxpositions,
+        cmd_settp, cmd_setstop, cmd_jito,
+        get_edit_conversation_handler
+    )
+    BUY_BOT_ENABLED = True
+except ImportError as e:
+    BUY_BOT_ENABLED = False
+    trading_bot = None
+# ========== END BUY BOT INTEGRATION ==========
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
 log = logging.getLogger("bot")
 log.info(f"Python runtime: {sys.version}")
+
+# Buy bot load status
+if BUY_BOT_ENABLED:
+    log.info("✅ Buy bot module loaded")
+else:
+    log.warning("⚠️  Buy bot not available - install buy-bot folder to enable trading")
 
 # -----------------------------------------------------------------------------
 # Env & Config
@@ -1206,6 +1228,37 @@ async def send_new_token(bot, chat_id: int, m: dict):
         log.info(f"[Alert] Sent alert for {m.get('name')} (already scraped, showing stored data)")
     else:
         log.info(f"[Alert] Sent alert for {m.get('name')} (no Twitter URL to scrape)")
+    
+    # ========== BUY BOT TRIGGER ==========
+    if BUY_BOT_ENABLED and trading_bot and trading_bot.is_active:
+        try:
+            # Wait for Twitter scraping to complete
+            await asyncio.sleep(3)
+            
+            # Get latest Twitter data
+            record = FIRST_SEEN.get(token, {})
+            tw_overlap = record.get("tw_overlap", "—")
+            bullseye_count = tw_overlap.count('🎯')
+            
+            # Prepare token data for buy bot
+            token_data = {
+                'token': token,
+                'name': m.get('name', 'Unknown'),
+                'price_usd': m.get('price_usd', 0.0),
+                'first_price': record.get('first_price', m.get('price_usd', 0.0)),
+                'mcap_usd': m.get('mcap_usd', 0.0),
+                'first_mcap_usd': m.get('first_mcap_usd', 0.0),
+                'tw_overlap': tw_overlap,
+                'bullseye_count': bullseye_count
+            }
+            
+            # Log and trigger
+            log.info(f"🤖 Buy bot check: {m.get('name')} → {bullseye_count} bullseye users")
+            await trading_bot.on_token_detected(token_data)
+            
+        except Exception as e:
+            log.error(f"❌ Buy bot trigger error: {e}")
+    # ========== END BUY BOT TRIGGER ==========
 
 async def send_price_update(bot, chat_id: int, m: dict):
     """
@@ -1354,19 +1407,37 @@ async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     global SUBS
     SUBS.add(u.effective_chat.id)
     _save_subs_to_file()
-    await u.message.reply_text(
+    
+    buy_bot_status = "✅ Enabled" if BUY_BOT_ENABLED else "❌ Not installed"
+    
+    message = (
         f"✅ Subscribed!\n\n"
         f"🔥 New tokens every {TRADE_SUMMARY_SEC}s (optimized for speed)\n"
         f"🧊 Price updates every {UPDATE_INTERVAL_SEC}s\n"
         f"🐦 Twitter scraper: {'Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else 'Disabled'}\n"
-        f"📊 Price tracking: Fresh API data (accurate 0% baseline)\n\n"
-        f"Commands:\n"
+        f"📊 Price tracking: ✅ FIXED - Uses Current Mcap baseline\n"
+        f"🤖 Buy Bot: {buy_bot_status}\n\n"
+        f"📋 Detection Commands:\n"
         f"/status - Bot stats\n"
         f"/trade [N] - Show N tokens\n"
         f"/scrape <url> - Manually scrape Twitter\n"
         f"/blacklist - Manage username blacklist\n"
         f"/resettoken <mint> - Reset token baseline"
     )
+    
+    if BUY_BOT_ENABLED:
+        message += (
+            f"\n\n💰 Buy Bot Commands:\n"
+            f"/on - Activate trading\n"
+            f"/off - Deactivate trading\n"
+            f"/buybotstatus - Check status & balance\n"
+            f"/portfolio - View open positions\n"
+            f"/setamount 0.01 - Set trade size (SOL)\n"
+            f"/setbullseye 3 - Min bullseye required\n"
+            f"/editbuybot - Interactive settings menu"
+        )
+    
+    await u.message.reply_text(message)
 
 async def cmd_id(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(str(u.effective_chat.id))
@@ -1386,7 +1457,8 @@ async def cmd_unsub(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     s = mirror_stats()
     cache_size = len(twitter_scraper.cache)
-    await u.message.reply_text(
+    
+    message = (
         f"📊 Bot Status\n\n"
         f"Subscribers: {len(SUBS)}\n"
         f"Tracked tokens: {len(TRACKED)}\n"
@@ -1397,8 +1469,16 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Active scrape tasks: {len(BACKGROUND_TASKS)}\n"
         f"Scraper: {'✅ Enabled (Auto separate)' if TWITTER_SCRAPER_ENABLED else '❌ Disabled'}\n"
         f"Detection speed: ⚡ {TRADE_SUMMARY_SEC}s (optimized)\n"
-        f"Price tracking: ✅ Fresh API data (accurate baseline)"
+        f"Price tracking: ✅ Fixed baseline (Current Mcap)"
     )
+    
+    if BUY_BOT_ENABLED and trading_bot:
+        status = "🟢 Active" if trading_bot.is_active else "🔴 Inactive"
+        message += f"\n\n🤖 Buy Bot: {status}"
+        if trading_bot.is_active:
+            message += f"\n💼 Open positions: {len(trading_bot.positions)}"
+    
+    await u.message.reply_text(message)
 
 async def cmd_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
     args = (u.message.text or "").split()
@@ -1729,19 +1809,40 @@ application.add_handler(CommandHandler("blacklist", cmd_blacklist))
 application.add_handler(CommandHandler("testreaders", cmd_testreaders))
 application.add_handler(CommandHandler("resettoken", cmd_resettoken))
 
+# ========== BUY BOT COMMANDS ==========
+if BUY_BOT_ENABLED:
+    application.add_handler(CommandHandler("on", cmd_on))
+    application.add_handler(CommandHandler("off", cmd_off))
+    application.add_handler(CommandHandler("buybotstatus", cmd_buybot_status))
+    application.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    application.add_handler(CommandHandler("setamount", cmd_setamount))
+    application.add_handler(CommandHandler("setbullseye", cmd_setbullseye))
+    application.add_handler(CommandHandler("maxpositions", cmd_maxpositions))
+    application.add_handler(CommandHandler("settp", cmd_settp))
+    application.add_handler(CommandHandler("setstop", cmd_setstop))
+    application.add_handler(CommandHandler("jito", cmd_jito))
+    application.add_handler(get_edit_conversation_handler())
+    log.info("✅ Buy bot commands registered")
+else:
+    log.info("⚠️  Buy bot commands not available")
+# ========== END BUY BOT COMMANDS ==========
+
 app = FastAPI(title="Telegram Webhook")
 app.add_middleware(GZipMiddleware, minimum_size=512)
 
 @app.get("/")
 async def health_root():
+    buy_bot_active = BUY_BOT_ENABLED and trading_bot and trading_bot.is_active
     return {
         "ok": True, 
         "twitter_scraper": TWITTER_SCRAPER_ENABLED, 
         "mode": "auto_separate_messages",
-        "price_detection": "fresh_api_data",
+        "price_detection": "FIXED_current_mcap_baseline",
         "detection_speed": f"{TRADE_SUMMARY_SEC}s",
         "ingestion_speed": f"{INGEST_INTERVAL_SEC}s",
-        "active_tasks": len(BACKGROUND_TASKS)
+        "active_tasks": len(BACKGROUND_TASKS),
+        "buy_bot_enabled": BUY_BOT_ENABLED,
+        "buy_bot_active": buy_bot_active
     }
 
 @app.get("/healthz")
@@ -1756,6 +1857,22 @@ async def _startup():
     MIRROR = _mirror_load()
     MY_HANDLES = load_my_following()
     TWITTER_BLACKLIST = load_twitter_blacklist()
+    
+    # ========== BUY BOT STARTUP ==========
+    if BUY_BOT_ENABLED:
+        try:
+            log.info("🤖 Initializing Buy Bot...")
+            config = TradingConfig()
+            await initialize_trading_bot(config)
+            balance = await trading_bot.wallet.get_balance(config.rpc_endpoint)
+            log.info(f"✅ Buy Bot ready! Wallet: {trading_bot.wallet.public_key}")
+            log.info(f"💰 Balance: {balance:.4f} SOL")
+            log.info(f"⚙️  Settings: ${config.trade_amount_sol} SOL/trade, {config.min_bullseye_users} bullseye min")
+        except Exception as e:
+            log.error(f"❌ Buy Bot initialization failed: {e}")
+            log.error("Trading will be disabled. Check wallet private key and RPC settings.")
+    # ========== END BUY BOT STARTUP ==========
+    
     asyncio.create_task(_start_bot_and_jobs())
 
 async def _start_bot_and_jobs():
