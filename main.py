@@ -625,7 +625,11 @@ def decorate_with_first_seen(pairs):
                 "tw_url": m.get("tw_url"),
             }
             
-            log.info(f"[Detection] ✅ Baseline set to ${cur_mcap:,.0f} (this will be 'First Mcap' in updates)")
+            # CRITICAL: On first detection, FORCE first_mcap_usd to equal mcap_usd
+            # This ensures "First Mcap (Onchain)" shows the same value as "Current Mcap"
+            m["first_mcap_usd"] = cur_mcap
+            
+            log.info(f"[Detection] ✅ Baseline set to ${cur_mcap:,.0f} (both first and current will show this value)")
             changed=True
         else:
             # Existing token: update only if needed
@@ -638,9 +642,11 @@ def decorate_with_first_seen(pairs):
             if not rec.get("tw_url") and m.get("tw_url"):
                 rec["tw_url"] = m.get("tw_url")
                 changed = True
+            
+            # For existing tokens, load the saved baseline
+            m["first_mcap_usd"]=float(FIRST_SEEN.get(tok,{}).get("first",0))
         
         m["is_first_time"]=is_new
-        m["first_mcap_usd"]=float(FIRST_SEEN.get(tok,{}).get("first",0))
     
     if changed: _save_first_seen(FIRST_SEEN)
 
@@ -908,16 +914,19 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     
     if is_first:
         # First detection: both blue emojis, show N/A for percentage
+        # CRITICAL: Both first and current should show the SAME value (current mcap)
+        # The label says "(Onchain)" but we're actually showing the CURRENT trading mcap
         first_emoji = BLUE
         current_emoji = BLUE
         pct = "N/A"  # No percentage on first detection
-        first_label = f"{BANK} <b>First Mcap (Onchain):</b>"  # Add (Onchain) label
+        # Show "First Mcap" without Onchain label to make it clearer
+        first_label = f"{BANK} <b>First Mcap:</b>"
     else:
         # Updates: first always blue, current shows movement
         first_emoji = BLUE
         current_emoji = "🟢" if (first > 0 and cur >= first) else "🔴"
         pct = _pct_str(first, cur)  # Show real percentage
-        first_label = f"{BANK} <b>First Mcap:</b>"  # No (Onchain) label on updates
+        first_label = f"{BANK} <b>First Mcap:</b>"
     
     price = float(m.get("price_usd") or 0)
     header = f"{fire_or_ice} <b>{html_escape(m['name'])}</b>"
@@ -1019,6 +1028,13 @@ async def send_new_token(bot, chat_id: int, m: dict):
     # Even if token was seen before restart, this is a NEW ALERT so show 🔥 FIRE
     m["is_first_time"] = True
     m["_is_update"] = False
+    
+    # CRITICAL FIX: On fire detection, FORCE first_mcap_usd to equal mcap_usd
+    # This ensures "First Mcap (Onchain)" displays the current trading price
+    # This is the value that will be used as baseline in ice updates
+    cur_mcap = float(m.get("mcap_usd") or 0)
+    m["first_mcap_usd"] = cur_mcap
+    log.info(f"[Fire] {token[:8]}... Forcing first_mcap_usd=${cur_mcap:,.0f} to match current mcap")
     
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
