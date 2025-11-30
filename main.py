@@ -737,13 +737,24 @@ def decorate_with_first_seen(pairs):
             # This ensures "First Mcap" shows the same value as "Current Mcap"
             m["first_mcap_usd"] = cur_mcap
             
-            log.info(f"[Detection] ✅ Baseline set to ${cur_mcap:,.0f} (both first and current will show this value)")
+            log.info(f"[Detection] ✅ SAVED baseline to FIRST_SEEN: ${cur_mcap:,.0f}")
             changed=True
         else:
-            # Existing token: update only if needed
+            # Existing token: NEVER overwrite the baseline "first" value
+            # Only update Twitter data if missing
             cur_mcap = float(m.get("mcap_usd") or 0)
-            if rec.get("first",0)==0 and cur_mcap>0:
-                rec["first"]=cur_mcap; changed=True
+            
+            # PROTECTION: Do NOT overwrite "first" if it's already set
+            # The baseline should be locked from the initial fire detection
+            existing_baseline = float(rec.get("first", 0))
+            if existing_baseline > 0:
+                log.info(f"[Detection] {tok[:8]}... Using EXISTING baseline: ${existing_baseline:,.0f}")
+            else:
+                # Only set if it was somehow 0 (shouldn't happen)
+                rec["first"] = cur_mcap
+                changed = True
+                log.warning(f"[Detection] {tok[:8]}... Baseline was 0, setting to ${cur_mcap:,.0f}")
+            
             if not rec.get("tw_handle") and m.get("tw_handle"):
                 rec["tw_handle"] = m.get("tw_handle")
                 changed = True
@@ -752,7 +763,7 @@ def decorate_with_first_seen(pairs):
                 changed = True
             
             # For existing tokens, load the saved baseline
-            m["first_mcap_usd"]=float(FIRST_SEEN.get(tok,{}).get("first",0))
+            m["first_mcap_usd"] = existing_baseline
         
         m["is_first_time"]=is_new
     
@@ -1145,7 +1156,18 @@ async def send_new_token(bot, chat_id: int, m: dict):
     # This is the value that will be used as baseline in ice updates
     cur_mcap = float(m.get("mcap_usd") or 0)
     m["first_mcap_usd"] = cur_mcap
-    log.info(f"[Fire] {token[:8]}... Forcing first_mcap_usd=${cur_mcap:,.0f} to match current mcap")
+    
+    # VERIFY: Check what's actually stored in FIRST_SEEN
+    stored_baseline = FIRST_SEEN.get(token, {}).get("first", 0)
+    log.info(f"[Fire] {token[:8]}... Fire mcap=${cur_mcap:,.0f}, Stored baseline=${stored_baseline:,.0f}")
+    
+    if abs(stored_baseline - cur_mcap) > 1:  # Allow for floating point errors
+        log.error(f"[Fire] ⚠️ MISMATCH! Stored baseline ${stored_baseline:,.0f} != Current mcap ${cur_mcap:,.0f}")
+        log.error(f"[Fire] This means ice updates will show WRONG baseline!")
+        log.error(f"[Fire] Fixing by updating FIRST_SEEN...")
+        FIRST_SEEN[token]["first"] = cur_mcap
+        _save_first_seen(FIRST_SEEN)
+        log.info(f"[Fire] ✅ Fixed and saved correct baseline: ${cur_mcap:,.0f}")
     
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
