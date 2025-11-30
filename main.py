@@ -1189,7 +1189,7 @@ async def send_price_update(bot, chat_id: int, m: dict):
     """
     Send price update for tracked token
     
-    CRITICAL: Must load saved baseline from FIRST_SEEN, NOT use API's first_mcap_usd
+    CRITICAL: In updates, ALWAYS set First Mcap equal to Current Mcap
     """
     token = m.get("token")
     
@@ -1197,14 +1197,10 @@ async def send_price_update(bot, chat_id: int, m: dict):
     first_rec = FIRST_SEEN.get(token) or {}
     saved_baseline = float(first_rec.get("first", 0))
     
-    # CRITICAL: Overwrite API's first_mcap_usd with saved baseline
-    # The API returns onchain price ($78k), but we want detection price ($134k)
-    if saved_baseline > 0:
-        m["first_mcap_usd"] = saved_baseline
-        log.info(f"[Update] {token[:8]}... Using saved baseline: ${saved_baseline:,.0f}")
-    else:
-        # Fallback if no saved baseline (shouldn't happen)
-        log.warning(f"[Update] {token[:8]}... No saved baseline, using API value")
+    # CRITICAL: In updates, ALWAYS set First Mcap equal to Current Mcap
+    current_mcap = float(m.get("mcap_usd") or 0)
+    m["first_mcap_usd"] = current_mcap
+    log.info(f"[Update] {token[:8]}... FORCING First Mcap = Current Mcap: ${current_mcap:,.0f}")
     
     # Get stored Twitter data
     stored_tw_handle = first_rec.get("tw_handle")
