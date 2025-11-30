@@ -1,12 +1,4 @@
-# Existing Telegram Bot Dependencies
-python-telegram-bot==20.7
-requests
-pandas
-beautifulsoup4
-fastapi
-uvicorn[standard]
-
-# Buy Bot Dependencies (ADD THESE)
+# Buy Bot Dependencies
 solana==0.30.2
 solders==0.18.1
 anchorpy==0.18.0
@@ -14,3 +6,273 @@ aiohttp==3.9.1
 websockets==12.0
 base58==2.1.1
 python-dotenv==1.0.0
+```
+
+6. Scroll down
+7. Commit message: "Add buy bot dependencies"
+8. Click **"Commit changes"**
+
+**✅ CHECKPOINT:** requirements.txt now has 13 dependencies total
+
+---
+
+## 🔑 STEP 5: GET FREE HELIUS RPC (5 min)
+
+### **5.1 Sign Up for Helius**
+
+1. Go to https://www.helius.dev
+2. Click **"Get Started"** or **"Sign Up"**
+3. Create account (no credit card needed!)
+4. Verify email
+
+### **5.2 Create RPC Endpoint**
+
+1. After login, click **"Create New Project"** or **"New API Key"**
+2. Name it: "Trading Bot"
+3. Select: **Solana Mainnet**
+4. Click **"Create"**
+
+### **5.3 Copy Your URLs**
+
+You'll see two URLs:
+
+**HTTP RPC URL:**
+```
+https://mainnet.helius-rpc.com/?api-key=abc123def456ghi789
+```
+
+**WebSocket URL:**
+```
+wss://mainnet.helius-rpc.com/?api-key=abc123def456ghi789
+```
+
+**Save both!** You'll need them in the next step.
+
+**✅ CHECKPOINT:** You have both RPC URLs saved
+
+---
+
+## ☁️ STEP 6: DEPLOY TO CLOUD RUN (10 min)
+
+### **6.1 Go to Cloud Run Console**
+
+1. Go to https://console.cloud.google.com/run
+2. Find your existing bot service
+3. Click on it
+4. Click **"Edit & Deploy New Revision"** (top)
+
+### **6.2 Add Environment Variables**
+
+1. Scroll down to **"Container"** section
+2. Click **"Variables & Secrets"** tab
+3. Click **"Add Variable"** (3 times for 3 new variables)
+
+**Add these 3 NEW variables:**
+
+**Variable 1:**
+```
+Name:  TRADING_WALLET_PRIVATE_KEY
+Value: [paste your Phantom private key]
+```
+
+**Variable 2:**
+```
+Name:  SOLANA_RPC_URL
+Value: [paste HTTP RPC URL from Helius]
+```
+
+**Variable 3:**
+```
+Name:  SOLANA_WS_URL
+Value: [paste WebSocket URL from Helius]
+```
+
+### **6.3 Keep Existing Variables**
+
+**Make sure these are still there:**
+- TG (your Telegram token)
+- ALERT_CHAT_ID
+- Any other variables you had before
+
+### **6.4 Deploy**
+
+1. Scroll to bottom
+2. Click **"Deploy"**
+3. Wait 2-5 minutes for deployment
+
+**You'll see:**
+- "Creating Revision..." 
+- "Routing traffic..."
+- "✓ Service deployed"
+
+**✅ CHECKPOINT:** Deployment shows "Ready" with green checkmark
+
+---
+
+## ✅ STEP 7: TEST EVERYTHING (5 min)
+
+### **7.1 Test: /start Command**
+
+In Telegram, send:
+```
+/start
+```
+
+**Expected response:**
+```
+✅ Subscribed!
+
+🔥 New tokens every 3s
+🧊 Price updates every 90s
+🐦 Twitter scraper: Enabled
+📊 Price tracking: ✅ FIXED
+🤖 Buy Bot: ✅ Enabled    ← Must see this!
+
+💰 Buy Bot Commands:       ← Must see this section!
+/on - Activate trading
+/off - Deactivate trading
+/buybotstatus - Check status
+...
+```
+
+**✅ If you see "Buy Bot: ✅ Enabled" → Good!**  
+**❌ If you see "Buy Bot: ❌ Not installed" → Problem!**
+
+### **7.2 Test: /buybotstatus Command**
+
+Send:
+```
+/buybotstatus
+```
+
+**Expected response:**
+```
+🤖 Buy Bot Status
+
+Status: 🔴 INACTIVE
+Wallet: 7xKXyP2wQ3r...
+Balance: 0.4523 SOL    ← Your balance!
+
+⚙️ Settings:
+- Trade Amount: $1.00 (0.005 SOL)
+- Min Bullseye: 3 users
+- Max Positions: 5
+- Take Profit: +50%
+- Stop Loss: -51%
+```
+
+**✅ If balance shows correctly → Perfect!**  
+**❌ If shows 0.0000 SOL → Check wallet was funded**
+
+### **7.3 Test: /on Command**
+
+Send:
+```
+/on
+```
+
+**Expected response:**
+```
+✅ Buy bot activated!
+
+Will auto-buy tokens with 3+ 🎯 bullseye users
+Trade size: 0.005 SOL ($1.00)
+```
+
+### **7.4 Verify Status Changed**
+
+Send `/buybotstatus` again:
+```
+Status: 🟢 ACTIVE    ← Changed from INACTIVE!
+```
+
+**✅ CHECKPOINT:** All 3 commands work perfectly
+
+---
+
+## 🎯 STEP 8: WAIT FOR FIRST DETECTION (10-30 min)
+
+### **8.1 What to Expect**
+
+The bot scans every 3 seconds. Within 10-30 minutes you should see:
+
+**Fire Detection:**
+```
+🔥 TokenName
+🏦 First Mcap: 🔵 $124,790
+🏦 Current Mcap: 🔵 $124,790 (N/A)
+💧 Liquidity: $61,210
+...
+```
+
+**Twitter Scrape (30-60 sec later):**
+```
+🔍 Scraping https://x.com/tokenname...
+✅ Found 25 accounts
+🎯 5 match your following
+```
+
+**If 5 ≥ 3 (threshold met):**
+```
+Bot logs:
+🤖 Buy bot check: TokenName → 5 bullseye users
+✅ BUY executed: TokenName for 0.005 SOL
+```
+
+### **8.2 Check Your First Trade**
+
+**In Telegram:**
+```
+/portfolio
+```
+
+**Shows:**
+```
+💼 Open Positions (1)
+
+1️⃣ TokenName
+💰 Entry: $0.00124790
+💵 Current: $0.00133892
+📊 P&L: +$0.09 (+7.3%)
+```
+
+**On Solscan:**
+1. Go to https://solscan.io
+2. Paste your wallet address
+3. See the swap transaction!
+
+**✅ CHECKPOINT:** First trade executed successfully!
+
+---
+
+## 🎉 STEP 9: YOU'RE LIVE!
+
+**Congratulations!** Your bot is now:
+
+✅ Detecting new tokens every 3 seconds  
+✅ Scraping Twitter for bullseye users  
+✅ Auto-buying tokens with 3+ bullseye  
+✅ Auto-selling at +50% or -51%  
+✅ Fully automated!
+
+---
+
+## 📊 ONGOING MONITORING
+
+### **Daily:**
+```
+/buybotstatus  → Check balance
+/portfolio     → Check open positions
+```
+
+### **Weekly:**
+- Check Solscan for all trades
+- Review which tokens were profitable
+- Adjust settings if needed
+
+### **Adjust Settings:**
+```
+/setamount 0.01    → Trade $2 instead of $1
+/setbullseye 5     → Require 5 bullseye instead of 3
+/settp 100         → Take profit at +100%
+/setstop 30        → Stop loss at -30%
