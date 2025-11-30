@@ -706,9 +706,10 @@ LAST_PINNED: Dict[Tuple[int, str], int] = {}
 def decorate_with_first_seen(pairs):
     """
     Decorate pairs with first-seen data.
-    For NEW tokens: Use CURRENT mirror data as baseline (no API fetch).
-    This ensures both first and current show the ACTUAL TRADING PRICE at detection.
-    NO MORE MIGRATION PRICES - just real Dexscreener trading price!
+    
+    CRITICAL FIX: For NEW tokens, store the CURRENT MCAP (from mcap_usd field)
+    as the baseline. This is what appears as "Current Mcap" in fire emoji detection,
+    and it should be used as "First Mcap" in all subsequent ice emoji updates.
     """
     changed=False; now_ts=int(time.time())
     for m in pairs:
@@ -717,22 +718,26 @@ def decorate_with_first_seen(pairs):
         is_new = rec is None
         
         if is_new:
-            # NEW TOKEN: Use CURRENT data from mirror (already has trading price)
-            # Don't fetch API - mirror data is accurate for current trading!
+            # NEW TOKEN: Store CURRENT MCAP as baseline
+            # This is the "Current Mcap" value shown in fire detection
             cur_mcap = float(m.get("mcap_usd") or 0)
             cur_price = float(m.get("price_usd") or 0)
             
-            log.info(f"[Detection] NEW token {tok[:8]}... First seen at ${cur_mcap:,.0f} (price: ${cur_price:.8f})")
+            log.info(f"[Detection] NEW token {tok[:8]}... Storing baseline at ${cur_mcap:,.0f} (price: ${cur_price:.8f})")
             
             FIRST_SEEN[tok] = {
-                "first": cur_mcap,  # Current trading mcap from mirror
-                "first_price": cur_price,  # Current trading price from mirror
+                "first": cur_mcap,  # ← FIXED: Store current mcap as baseline
+                "first_price": cur_price,
                 "ts": now_ts,
                 "tw_handle": m.get("tw_handle"),
                 "tw_url": m.get("tw_url"),
             }
             
-            log.info(f"[Detection] ✅ Baseline set: ${cur_mcap:,.0f} (both first and current match)")
+            # CRITICAL: On first detection, FORCE first_mcap_usd to equal mcap_usd
+            # This ensures "First Mcap" shows the same value as "Current Mcap"
+            m["first_mcap_usd"] = cur_mcap
+            
+            log.info(f"[Detection] ✅ Baseline set to ${cur_mcap:,.0f} (both first and current will show this value)")
             changed=True
         else:
             # Existing token: update only if needed
@@ -745,9 +750,11 @@ def decorate_with_first_seen(pairs):
             if not rec.get("tw_url") and m.get("tw_url"):
                 rec["tw_url"] = m.get("tw_url")
                 changed = True
+            
+            # For existing tokens, load the saved baseline
+            m["first_mcap_usd"]=float(FIRST_SEEN.get(tok,{}).get("first",0))
         
         m["is_first_time"]=is_new
-        m["first_mcap_usd"]=float(FIRST_SEEN.get(tok,{}).get("first",0))
     
     if changed: _save_first_seen(FIRST_SEEN)
 
@@ -1019,16 +1026,18 @@ def build_caption(m: dict, fb_text:str, is_update: bool) -> str:
     
     if is_first:
         # First detection: both blue emojis, show N/A for percentage
+        # CRITICAL: Both first and current should show the SAME value (current mcap)
         first_emoji = BLUE
         current_emoji = BLUE
         pct = "N/A"  # No percentage on first detection
-        first_label = f"{BANK} <b>First Mcap (Onchain):</b>"  # Add (Onchain) label
+        # Removed "(Onchain)" label - both should show current trading mcap
+        first_label = f"{BANK} <b>First Mcap:</b>"
     else:
         # Updates: first always blue, current shows movement
         first_emoji = BLUE
         current_emoji = "🟢" if (first > 0 and cur >= first) else "🔴"
         pct = _pct_str(first, cur)  # Show real percentage
-        first_label = f"{BANK} <b>First Mcap:</b>"  # No (Onchain) label on updates
+        first_label = f"{BANK} <b>First Mcap:</b>"
     
     price = float(m.get("price_usd") or 0)
     header = f"{fire_or_ice} <b>{html_escape(m['name'])}</b>"
@@ -1130,6 +1139,13 @@ async def send_new_token(bot, chat_id: int, m: dict):
     # Even if token was seen before restart, this is a NEW ALERT so show 🔥 FIRE
     m["is_first_time"] = True
     m["_is_update"] = False
+    
+    # CRITICAL FIX: On fire detection, FORCE first_mcap_usd to equal mcap_usd
+    # This ensures "First Mcap" displays the current trading price (not onchain price)
+    # This is the value that will be used as baseline in ice updates
+    cur_mcap = float(m.get("mcap_usd") or 0)
+    m["first_mcap_usd"] = cur_mcap
+    log.info(f"[Fire] {token[:8]}... Forcing first_mcap_usd=${cur_mcap:,.0f} to match current mcap")
     
     caption = build_caption(m, fb_text, is_update=False)
     kb = link_keyboard(m)
