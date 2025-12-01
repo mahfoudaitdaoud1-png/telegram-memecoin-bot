@@ -1,0 +1,24 @@
+version: "3.9"
+services:
+  bot:
+    build: .
+    image: dexscreener-bot:latest
+    environment:
+      TG: ${TG}
+      ALERT_CHAT_ID: ${ALERT_CHAT_ID:-0}
+      TRADE_SUMMARY_SEC: ${TRADE_SUMMARY_SEC:-5}
+      UPDATE_INTERVAL_SEC: ${UPDATE_INTERVAL_SEC:-90}
+      UPDATE_MAX_DURATION_MIN: ${UPDATE_MAX_DURATION_MIN:-60}
+      INGEST_INTERVAL_SEC: ${INGEST_INTERVAL_SEC:-12}
+      MIRROR_JSON: /tmp/telegram-bot/mirror.json
+      MIN_LIQ_USD: ${MIN_LIQ_USD:-35000}
+      MIN_MCAP_USD: ${MIN_MCAP_USD:-70000}
+      MIN_VOL_H24_USD: ${MIN_VOL_H24_USD:-40000}
+      MAX_AGE_MIN: ${MAX_AGE_MIN:-120}
+      CHAIN_ID: ${CHAIN_ID:-solana}
+    ports:
+      - "8080:8080"
+    volumes:
+      - mirror:/tmp/telegram-bot
+volumes:
+  mirror:

@@ -1,0 +1,22 @@
+cd ~/telegram-bot && \
+python3 -m pip install --upgrade 'python-telegram-bot[job-queue]==21.6' requests && \
+export TG='8310323018:AAEJxIYry4fc-AOcsJzoUScXJ4jM6sIyC2I' \
+ALERT_CHAT_ID=1502658246 \
+TRADE_SUMMARY_SEC=3 \
+UPDATE_INTERVAL_SEC=90 \
+UPDATE_MAX_DURATION_MIN=60 \
+INGEST_INTERVAL_SEC=8 \
+MIN_LIQ_USD=35000 \
+MIN_MCAP_USD=70000 \
+MIN_VOL_H24_USD=40000 \
+MAX_AGE_MIN=120 \
+AXIOM_WEB_URL='https://axiom.trade/meme/{pair}' \
+GMGN_WEB_URL='https://gmgn.ai/sol/token/{mint}' \
+MY_FOLLOWING_TXT='handles.partial.txt' \
+TW_BEARER='AAAAAAAAAAAAAAAAAAAAAFiR3wEAAAAAPTW18txMP7PaUDqJdhA0%2By1zvFI%3DzbYdNqjcHWhXFkitt8mZpj7r0uFd4QxlARdyXuhiFq8WP5hXWp' \
+FOLLOWERS_CACHE_DIR='~/telegram-bot/followers_cache' \
+TOP_N_PER_TICK=0 \
+NO_MATCH_PING=0 && \
+python3 main.py 2>&1 | tee -a bot.log
+SOLANA_RPC_URL='https://mainnet.helius-rpc.com/?api-key=580184ef-d372-4cc7-b5c6-73ea0ab55276' \
+SOLANA_WS_URL='wss://mainnet.helius-rpc.com/?api-key=580184ef-d372-4cc7-b5c6-73ea0ab55276' \
